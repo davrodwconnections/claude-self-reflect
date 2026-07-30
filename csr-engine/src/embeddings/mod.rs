@@ -34,7 +34,11 @@ impl EmbeddingEngine {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
             }
-            let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            // Multilingual model (Spanish + English), same 384 dims as the
+            // upstream AllMiniLML6V2 so the schema and HNSW index are untouched.
+            // The existing index was built with THIS model — building with the
+            // English model produces vectors incompatible with every stored one.
+            let options = InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2)
                 .with_cache_dir(cache_dir.clone())
                 .with_show_download_progress(true);
             match TextEmbedding::try_new(options) {
