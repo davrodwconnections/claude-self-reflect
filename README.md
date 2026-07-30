@@ -1,5 +1,38 @@
 # Claude Self-Reflect
 
+> ### About this fork
+>
+> This is a fork of [ramakay/claude-self-reflect](https://github.com/ramakay/claude-self-reflect).
+> All the credit for the project belongs to its author — the original README follows below,
+> unchanged. This fork exists for two reasons, and carries two commits on top of upstream:
+>
+> **1. It builds and runs on native Windows.** Upstream ships binaries for macOS and Linux
+> only, and the crate did not compile for a Windows target: one function identified files by
+> their Unix inode. That check is now per-platform, with no behaviour change on Unix. Nothing
+> else in the codebase stood in the way — no Unix-only dependencies, no `cfg(unix)` blocks.
+> This commit is generic and is intended to be offered upstream.
+>
+> **2. It embeds with a multilingual model.** Upstream uses `all-MiniLM-L6-v2`, which is
+> English-only. Over a Spanish-language corpus it scored everything low and nearly identically
+> (0.544–0.551 across the top three of a query it never answered correctly), which leaves the
+> ranking with almost no signal. Switching to `paraphrase-multilingual-MiniLM-L12-v2` — same
+> 384 dimensions, so the schema and the HNSW index are untouched — returned the correct
+> conversation at ranks 1 and 2, scored across 0.515–0.641. **This one is a divergence, not a
+> fix:** for an English corpus the English-only model is the better default, so it is not
+> upstream material as-is.
+>
+> **Building it:**
+>
+> ```
+> cd csr-engine
+> cargo build --release -j 2
+> ```
+>
+> Requires the Rust toolchain and the MSVC build tools. The `-j 2` is not cosmetic: at the
+> default job count `rustc.exe` aborted with `STATUS_HEAP_CORRUPTION` on this machine — a
+> compiler crash, not a build error. Reindex after changing the embedding model; vectors from
+> a different model are not comparable.
+
 <div align="center">
 
 <img src="docs-site/public/favicon.svg" alt="Claude Self-Reflect" width="80" height="80" />
