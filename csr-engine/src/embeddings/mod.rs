@@ -5,7 +5,15 @@ use std::sync::Mutex;
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-/// Wraps fastembed for 384-dim all-MiniLM-L6-v2 embeddings.
+/// Wraps fastembed for 384-dim paraphrase-multilingual-MiniLM-L12-v2 embeddings.
+///
+/// Upstream uses all-MiniLM-L6-v2, which is English-only: on a Spanish-language
+/// transcript corpus it returns scores that are both low and tightly clustered
+/// (measured: 0.544-0.551 across the top 3 of an unrelated query), so ranking
+/// carries almost no signal. The multilingual model has the same 384 dimensions,
+/// which keeps the schema and the HNSW index unchanged, and needs no query/passage
+/// prefixes (unlike the E5 family).
+///
 /// Thread-safe via Mutex (TextEmbedding::embed requires &mut self).
 pub struct EmbeddingEngine {
     model: Mutex<TextEmbedding>,
@@ -34,7 +42,7 @@ impl EmbeddingEngine {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
             }
-            let options = InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+            let options = InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2)
                 .with_cache_dir(cache_dir.clone())
                 .with_show_download_progress(true);
             match TextEmbedding::try_new(options) {
