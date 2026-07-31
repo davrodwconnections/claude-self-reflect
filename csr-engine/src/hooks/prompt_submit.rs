@@ -29,10 +29,28 @@ use crate::search::cross_project::resolve_project_from_cwd;
 use crate::temporal;
 
 /// Token budget for prompt-submit injection (larger than Stop hook's 300).
-const PROMPT_TOKEN_BUDGET: usize = 500;
+///
+/// Lowered 500 -> 150 on 2026-07-31 after measuring a real session: this hook
+/// alone injected ~15k tokens across 22 prompts (~681 each, i.e. already over
+/// the old budget once headers are added). Most of that was mid-relevance
+/// filler. The high-scoring pickup paths are unaffected — they print before
+/// this budget applies.
+const PROMPT_TOKEN_BUDGET: usize = 150;
 
 /// Minimum prompt length to trigger search (avoids noise from short prompts).
-const MIN_PROMPT_LENGTH: usize = 15;
+///
+/// Raised 15 -> 40 on 2026-07-31: prompts like "?", "dale" or "no metas ruido"
+/// cleared the old floor and triggered a full semantic search whose results
+/// could not be relevant, because the prompt carries no topic to match on.
+const MIN_PROMPT_LENGTH: usize = 40;
+
+/// Minimum length (in characters) for a chunk to be worth injecting.
+///
+/// Chunking splits transcripts on size, not on sentence boundaries, so it can
+/// emit fragments like "[chunk] ." or "[chunk] nto." — seen live on
+/// 2026-07-31. Nothing that short can carry usable context, and there was no
+/// floor before this.
+const MIN_CHUNK_CHARS: usize = 80;
 
 /// Minimum cosine similarity between the prompt and a session's best
 /// reflection for the Route B episode-correlation pickup to fire. Calibrated
@@ -267,8 +285,11 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
+    // Tightened 15/0.55 -> 5/0.68 on 2026-07-31: at 0.55 the tail of the result
+    // set was filler that still consumed budget. Raising the floor keeps the
+    // matches that actually carry context and drops the rest.
     let chunk_results =
-        search_chunks_with_vec(engine, &query_vec, 15, 0.55, &current_project).await;
+        search_chunks_with_vec(engine, &query_vec, 5, 0.68, &current_project).await;
 
     // 3. Search reflections (stored insights) — scoped to current project
     let reflection_results =
@@ -734,6 +755,13 @@ async fn search_chunks_with_vec(
             if let Some(chunk) = chunks.into_iter().next() {
                 // Project scope filter: skip chunks from other projects
                 if !project.is_empty() && chunk.project_name != project {
+                    continue;
+                }
+
+                // Size gate: a fragment this short cannot carry context, and
+                // chunking splits on size rather than sentence boundaries, so
+                // these do occur. See MIN_CHUNK_CHARS.
+                if chunk.content.trim().chars().count() < MIN_CHUNK_CHARS {
                     continue;
                 }
 
@@ -1236,7 +1264,33 @@ mod tests {
     #[test]
     fn test_min_prompt_length() {
         assert!("short".len() < MIN_PROMPT_LENGTH);
-        assert!("fix the authentication timeout bug".len() >= MIN_PROMPT_LENGTH);
+        assert!("fix the authentication timeout bug in the login flow".len() >= MIN_PROMPT_LENGTH);
+
+        // Raised to 40 on 2026-07-31. These are real prompts that used to clear
+        // the old floor of 15 and trigger a full semantic search, even though
+        // they carry no topic to match against.
+        for bare in ["?", "dale", "no metas ruido", "que es lo que quieres hacer"] {
+            assert!(
+                bare.len() < MIN_PROMPT_LENGTH,
+                "expected {:?} to be below the search floor",
+                bare
+            );
+        }
+    }
+
+    #[test]
+    fn test_min_chunk_chars() {
+        // Fragments this short were observed live on 2026-07-31; chunking
+        // splits on size, not sentence boundaries, so they do reach injection.
+        for junk in [".", "nto.", "apuntadas.", "ro que lo decidas tu."] {
+            assert!(
+                junk.chars().count() < MIN_CHUNK_CHARS,
+                "expected {:?} to be filtered out",
+                junk
+            );
+        }
+        let real = "Su BannerKings NO es el oficial de Nexus: el juego corre una compilacion propia con dos arreglos.";
+        assert!(real.chars().count() >= MIN_CHUNK_CHARS);
     }
 
     #[test]
