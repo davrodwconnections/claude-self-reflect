@@ -285,15 +285,21 @@ async fn handle_inner(input: &HookInput, engine: &Engine, cwd: &Path) -> Result<
 
     // 2. Search chunks (past conversations) — scoped to current project
     // Over-fetch to compensate for project filtering (Codex M-1 fix)
-    // Tightened 15/0.55 -> 5/0.68 on 2026-07-31: at 0.55 the tail of the result
-    // set was filler that still consumed budget. Raising the floor keeps the
-    // matches that actually carry context and drops the rest.
+    // Tightened 15/0.55 -> 5/0.60 on 2026-07-31. First attempt used 0.68 and
+    // was measured too aggressive: an A/B run on the prompt "que quedo
+    // pendiente del formulario de time off" lost all four on-topic RFTO chunks,
+    // which scored between 0.55 and 0.68. 0.60 keeps them and still drops the
+    // tail.
     let chunk_results =
-        search_chunks_with_vec(engine, &query_vec, 5, 0.68, &current_project).await;
+        search_chunks_with_vec(engine, &query_vec, 5, 0.60, &current_project).await;
 
     // 3. Search reflections (stored insights) — scoped to current project
+    // Raised 10/0.45 -> 4/0.60 on 2026-07-31, same A/B run: with chunks
+    // tightened, the looser reflection floor was what filled the gap, and what
+    // it let through was noise ("Tool permission request failed", a raw
+    // scheduled-task dump). Reflections must clear the same bar as chunks.
     let reflection_results =
-        search_reflections_with_vec(engine, &query_vec, 10, 0.45, &current_project).await;
+        search_reflections_with_vec(engine, &query_vec, 4, 0.60, &current_project).await;
 
     // 4. Combine and score results (with continuity boost for recent session)
     let current_files: Vec<String> = extract_file_paths_from_prompt(prompt);
