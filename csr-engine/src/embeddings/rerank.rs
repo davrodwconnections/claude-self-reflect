@@ -13,6 +13,9 @@ static RERANKER: OnceLock<Option<Mutex<TextRerank>>> = OnceLock::new();
 /// on the paraphrase set and keeps latency near 1 s for ten documents.
 const DOC_CHARS: usize = 600;
 
+/// ONNX intra-op threads when the reranker runs on the CPU.
+const CPU_THREADS: usize = 8;
+
 fn model_from_env() -> Option<RerankerModel> {
     match std::env::var("CSR_RERANKER").ok()?.as_str() {
         "jina" => Some(RerankerModel::JINARerankerV2BaseMultiligual),
@@ -38,8 +41,16 @@ pub fn scores(query: &str, docs: &[String]) -> Option<Vec<f32>> {
     let cell = RERANKER.get_or_init(|| {
         let model = model_from_env()?;
         let cache_dir = super::cache::cache_dir();
-        let options = RerankInitOptions::new(model).with_cache_dir(cache_dir);
-        match TextRerank::try_new(options) {
+        let options = || RerankInitOptions::new(model.clone()).with_cache_dir(cache_dir.clone());
+        if let Some(providers) = super::gpu_providers() {
+            match TextRerank::try_new(options().with_execution_providers(providers)) {
+                Ok(m) => return Some(Mutex::new(m)),
+                Err(e) => tracing::warn!(error = %e, "GPU reranker init failed; using CPU"),
+            }
+        }
+        // CPU fallback with bounded threads: ONNX on every core is the load that
+        // crashes this machine's CPU.
+        match TextRerank::try_new(options().with_intra_threads(CPU_THREADS)) {
             Ok(m) => Some(Mutex::new(m)),
             Err(e) => {
                 tracing::warn!(error = %e, "reranker init failed; reranking disabled");

@@ -18,6 +18,11 @@ async fn main() -> Result<()> {
     if std::env::var_os("CSR_RERANKER").is_none() {
         std::env::set_var("CSR_RERANKER", "jina");
     }
+    // Run ONNX on the GPU (DirectML) unless told otherwise; this machine's CPU
+    // crashes under sustained ONNX load. Falls back to the CPU if the GPU fails.
+    if std::env::var_os("CSR_GPU").is_none() {
+        std::env::set_var("CSR_GPU", "directml");
+    }
     Engine::new(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]))?
         .serve_mcp().await
 }

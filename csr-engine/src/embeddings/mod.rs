@@ -39,6 +39,18 @@ impl EmbeddingEngine {
             .lock()
             .map_err(|e| anyhow::anyhow!("model init lock: {e}"))?;
 
+        if let Some(providers) = gpu_providers() {
+            let options = embedding_init_options(cache_dir.clone()).with_execution_providers(providers);
+            match TextEmbedding::try_new(options) {
+                Ok(model) => {
+                    return Ok(Self {
+                        model: Mutex::new(model),
+                    })
+                }
+                Err(e) => tracing::warn!(error = %e, "GPU embedding init failed; using CPU"),
+            }
+        }
+
         // Retry across processes: another csr-engine may hold the hf-hub blob
         // lock mid-download; once it finishes, the cached model loads instantly.
         let mut last_err = None;
@@ -88,10 +100,35 @@ impl EmbeddingEngine {
     }
 }
 
+/// DirectML on the high-performance GPU when `CSR_GPU=directml`, else `None`
+/// (CPU). Registration errors instead of silently falling back, so callers can
+/// log the fallback; on this machine the CPU crashes under sustained ONNX load
+/// (i9-13900K instability), which is why the GPU path exists.
+pub(crate) fn gpu_providers() -> Option<Vec<fastembed::ExecutionProviderDispatch>> {
+    if std::env::var("CSR_GPU").ok().as_deref() != Some("directml") {
+        return None;
+    }
+    Some(vec![ort::ep::DirectML::default()
+        .with_performance_preference(ort::ep::directml::PerformancePreference::HighPerformance)
+        .build()
+        .error_on_failure()])
+}
+
+/// ONNX intra-op threads for embedding; `CSR_EMBED_THREADS` overrides the
+/// default. Bulk re-imports crashed inside ONNX Runtime's threaded GEMM
+/// (MlasSgemmThreaded) on this machine, so the knob allows a quieter setting.
+fn embedding_threads() -> usize {
+    std::env::var("CSR_EMBED_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(EMBEDDING_INTRA_THREADS)
+}
+
 fn embedding_init_options(cache_dir: PathBuf) -> InitOptions {
     InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2Q)
         .with_cache_dir(cache_dir)
-        .with_intra_threads(EMBEDDING_INTRA_THREADS)
+        .with_intra_threads(embedding_threads())
         .with_show_download_progress(true)
 }
 

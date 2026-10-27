@@ -876,6 +876,7 @@ dependencies = [
  "fs2",
  "hnsw_rs",
  "notify",
+ "ort",
  "ratatui",
  "regex",
  "reqwest",
