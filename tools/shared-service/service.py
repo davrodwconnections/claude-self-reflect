@@ -93,6 +93,8 @@ class Worker:
             if key.endswith("API_KEY") or key in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
                 env.pop(key, None)
         env.update(CSR_SHARED_WORKER="1", CSR_DISABLE_RECURSIVE_HOOKS="1", CSR_FORCE_IMPORT="1")
+        # Seconds before the worker frees the GPU memory its models hold.
+        env["CSR_MODEL_IDLE_SECS"] = str(self.cfg.get("model_idle_seconds", 300))
         log = self.base / "worker.log"
         if log.exists() and log.stat().st_size > 2_000_000:
             os.replace(log, self.base / "worker.previous.log")
@@ -382,15 +384,13 @@ def create_app(cfg, base):
             return JSONResponse({"error": str(e)[:1200]}, status_code=500)
 
     async def hint(request):
-        # Prompt-submit memory hints. Never queues behind other work: a busy
-        # worker means no hint for this prompt rather than a slow prompt.
+        # Prompt-submit memory hints. Waits for its turn behind other work: the
+        # user prefers a slower prompt to a prompt without its hint.
         try:
             body = await request.json()
             query = str(body.get("query", ""))[:2000]
             if len(query.strip()) < 15:
                 return JSONResponse({"hits": []})
-            if worker.lock.locked():
-                return JSONResponse({"hits": [], "skipped": "busy"})
             args = {"query": query, "limit": max(1, min(5, int(body.get("limit") or 2)))}
             if body.get("exclude_conversation"):
                 args["exclude_conversation"] = str(body["exclude_conversation"])[:250]

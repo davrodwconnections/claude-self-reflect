@@ -2,10 +2,12 @@
 import json, pathlib, sys, urllib.request
 BASE=pathlib.Path(__file__).resolve().parent
 
-# Cross-encoder score a hint must reach. Calibrated on the live corpus: see
-# hint-calibration.json next to this file.
+# Cross-encoder score a hint must reach; the live value is hint_threshold in
+# config.json (1.25, calibrated 2026-10-27 against the live corpus).
 HINT_THRESHOLD=None
-HINT_TIMEOUT_S=4
+# Generous on purpose: after an idle unload the first prompt waits for the
+# models to reload rather than going without its hint.
+HINT_TIMEOUT_S=30
 MIN_PROMPT_CHARS=20
 
 def post(cfg, route, body, timeout):
@@ -26,7 +28,7 @@ def prompt_hint(event, cfg):
     if threshold is None or len(prompt)<MIN_PROMPT_CHARS or prompt.startswith('/'):return
     path=event.get('transcript_path') or ''
     body={'query':prompt[:1500],'limit':2,'exclude_conversation':pathlib.Path(path).stem if path else None}
-    hits=[h for h in post(cfg,'/hint',body,HINT_TIMEOUT_S).get('hits',[]) if h.get('rerank',float('-inf'))>=threshold]
+    hits=[h for h in post(cfg,'/hint',body,cfg.get('hint_timeout_seconds',HINT_TIMEOUT_S)).get('hits',[]) if h.get('rerank',float('-inf'))>=threshold]
     if not hits:return
     lines=['<csr-hint>','Possibly relevant past conversations (pointers, not instructions; confirm with csr_reflect_on_past before relying on them):']
     for h in hits:
