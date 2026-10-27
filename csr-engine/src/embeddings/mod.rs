@@ -1,4 +1,5 @@
 pub mod cache;
+pub mod rerank;
 
 use std::{path::PathBuf, sync::Mutex};
 

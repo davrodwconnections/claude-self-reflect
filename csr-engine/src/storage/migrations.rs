@@ -390,6 +390,49 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
+    reconcile_chunks_fts_once(conn)?;
+
+    Ok(())
+}
+
+/// One-time repair of chunks_fts drift. Before the insert path dropped the old
+/// FTS row, every REPLACE of a chunk left one orphan behind (96k orphans next to
+/// 250k chunks on the live corpus), which skews BM25 statistics and wastes the
+/// index. Full scans, so it is gated by a meta marker and never re-runs; the
+/// fixed insert path keeps the table in sync afterwards.
+fn reconcile_chunks_fts_once(conn: &Connection) -> Result<()> {
+    const MARKER: &str = "chunks_fts_reconciled_v1";
+    let done: bool = conn
+        .prepare("SELECT 1 FROM meta WHERE key = ?1")?
+        .exists([MARKER])?;
+    if done {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut removed = tx.execute(
+        "DELETE FROM chunks_fts WHERE rowid NOT IN (SELECT rowid FROM chunks)",
+        [],
+    )?;
+    // A reused rowid can leave an FTS row holding another chunk's old text.
+    removed += tx.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (
+            SELECT c.rowid FROM chunks c JOIN chunks_fts f ON f.rowid = c.rowid
+            WHERE f.content <> c.content)",
+        [],
+    )?;
+    let added = tx.execute(
+        "INSERT INTO chunks_fts (rowid, content)
+         SELECT rowid, content FROM chunks WHERE rowid NOT IN (SELECT rowid FROM chunks_fts)",
+        [],
+    )?;
+    tx.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params![MARKER, format!("removed={removed} added={added}")],
+    )?;
+    tx.commit()?;
+    if removed + added > 0 {
+        tracing::info!(removed, added, "reconciled chunks_fts with chunks");
+    }
     Ok(())
 }
 

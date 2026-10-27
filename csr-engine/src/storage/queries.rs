@@ -164,6 +164,13 @@ pub fn insert_chunk_with_source(
     embedding: &[f32],
     source: &str,
 ) -> Result<()> {
+    // REPLACE deletes and re-inserts the chunks row under a new rowid, and
+    // chunks_fts is rowid-addressed: drop the FTS row of the current rowid first
+    // or every re-import of a growing transcript leaves an orphan behind.
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+        params![chunk.id],
+    )?;
     conn.execute(
         "INSERT OR REPLACE INTO chunks (id, conversation_id, project_name, timestamp, content, message_count, summary, seq, is_sidechain, source)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -502,6 +509,29 @@ pub fn get_chunk_ids_in_timerange(
 
 // ─── FTS5 full-text search ───
 
+/// Upper bound on OR-ed terms per FTS5 query; long pasted prompts otherwise
+/// turn into dozens of posting-list walks.
+const FTS_MAX_TERMS: usize = 16;
+
+/// Spanish and English function words. The corpus is mostly Spanish with
+/// English code and tool output, so both lists apply to every query.
+fn is_fts_stopword(word: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        // es
+        "de", "la", "que", "el", "en", "los", "las", "del", "se", "por", "un", "una", "con",
+        "no", "su", "al", "lo", "como", "más", "mas", "pero", "sus", "le", "ya", "o", "este",
+        "esta", "si", "sí", "porque", "muy", "sin", "sobre", "también", "me", "hay", "donde",
+        "desde", "todo", "nos", "cuando", "uno", "les", "ni", "otro", "ese", "eso", "esa",
+        "para", "es", "son", "fue", "ha", "yo", "tu", "te", "mi", "qué", "y", "a", "e", "u",
+        // en
+        "the", "of", "and", "to", "in", "is", "it", "that", "for", "on", "with", "as", "was",
+        "be", "at", "by", "this", "an", "are", "or", "from", "but", "not", "have", "has",
+        "you", "we", "they", "if", "so", "do", "can", "will", "what", "which", "there",
+    ];
+    let lower = word.to_lowercase();
+    STOPWORDS.contains(&lower.as_str())
+}
+
 /// Search chunks using FTS5 full-text search (for file path lookup etc.).
 pub fn fts5_search(
     conn: &Connection,
@@ -512,6 +542,8 @@ pub fn fts5_search(
     // Sanitize for FTS5: split into OR-joined quoted words
     // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
     // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
+    // Stopwords match most of the corpus: OR-ing them in multiplies the posting
+    // lists BM25 has to walk while adding almost no ranking signal.
     let words: Vec<String> = query
         .split_whitespace()
         .map(|w| {
@@ -519,7 +551,8 @@ pub fn fts5_search(
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
                 .collect::<String>()
         })
-        .filter(|w| w.len() >= 2)
+        .filter(|w| w.chars().count() >= 2 && !is_fts_stopword(w))
+        .take(FTS_MAX_TERMS)
         .collect();
     if words.is_empty() {
         return Ok(Vec::new());
@@ -2319,6 +2352,71 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrations::run(&conn).unwrap();
         conn
+    }
+
+    fn fts_chunk(id: &str, content: &str) -> ConversationChunk {
+        ConversationChunk {
+            id: id.into(),
+            conversation_id: "conv-1".into(),
+            project_name: "test".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: content.into(),
+            message_count: 1,
+            summary: None,
+            author: crate::provenance::Speaker::User,
+            seq: 0,
+            is_sidechain: false,
+        }
+    }
+
+    fn fts_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn test_reimport_keeps_one_fts_row_per_chunk() {
+        let conn = mem();
+        let emb = vec![0.0f32; 384];
+        insert_chunk(&conn, &fts_chunk("a", "first draft"), &emb).unwrap();
+        insert_chunk(&conn, &fts_chunk("b", "other chunk"), &emb).unwrap();
+        // A growing transcript re-imports chunk "a" with more text.
+        insert_chunk(&conn, &fts_chunk("a", "first draft grown longer"), &emb).unwrap();
+        assert_eq!(fts_rows(&conn), 2, "REPLACE must not leave an orphan FTS row");
+        let hits = fts5_search(&conn, "grown", 10, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "a");
+    }
+
+    #[test]
+    fn test_fts_reconcile_removes_orphans_and_stale_rows_once() {
+        let conn = mem();
+        let emb = vec![0.0f32; 384];
+        insert_chunk(&conn, &fts_chunk("a", "alpha text"), &emb).unwrap();
+        insert_chunk(&conn, &fts_chunk("b", "beta text"), &emb).unwrap();
+        let rowid_b: i64 = conn
+            .query_row("SELECT rowid FROM chunks WHERE id = 'b'", [], |r| r.get(0))
+            .unwrap();
+        // Simulate pre-fix drift: an orphan, a stale row and a missing row.
+        conn.execute_batch(&format!(
+            "INSERT INTO chunks_fts (rowid, content) VALUES (9999, 'orphan text');
+             UPDATE chunks_fts SET content = 'stale text' WHERE rowid = {rowid_b};
+             DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = 'a');
+             DELETE FROM meta WHERE key = 'chunks_fts_reconciled_v1';"
+        ))
+        .unwrap();
+
+        migrations::run(&conn).unwrap();
+        assert_eq!(fts_rows(&conn), 2);
+        assert!(fts5_search(&conn, "orphan", 10, None).unwrap().is_empty());
+        assert!(fts5_search(&conn, "stale", 10, None).unwrap().is_empty());
+        assert_eq!(fts5_search(&conn, "alpha", 10, None).unwrap().len(), 1);
+        assert_eq!(fts5_search(&conn, "beta", 10, None).unwrap().len(), 1);
+
+        // The marker stops it from scanning again on the next open.
+        conn.execute("INSERT INTO chunks_fts (rowid, content) VALUES (8888, 'late orphan')", [])
+            .unwrap();
+        migrations::run(&conn).unwrap();
+        assert_eq!(fts_rows(&conn), 3, "reconcile must run only once");
     }
 
     #[test]

@@ -34,6 +34,57 @@ fn extract_conv_id(query: &str) -> Option<&str> {
     None
 }
 
+/// Candidates taken from each of the vector and BM25 pools in reflect_on_past.
+const HYBRID_POOL: usize = 30;
+
+/// Weight of the BM25 rank in the ordering score, on the cosine scale. It has
+/// to be this large because the provenance rerank adds ±0.5 per chunk, which
+/// swamps a cosine spread of 0.6–0.8.
+///
+/// Measured 2026-10-27 on a copy of the live corpus (250k chunks), conversation
+/// in top 10 / MRR: 31 hand-written paraphrase questions 16/0.36 with vector
+/// search alone → 25/0.57 at 2.0; 60 verbatim snippets 18 → 53. Weights 1.0
+/// and 5.0 scored lower on paraphrases; pure RRF lost on every set.
+const HYBRID_LEXICAL_WEIGHT: f32 = 2.0;
+
+/// Fused candidates the optional cross-encoder re-scores. Top 10 with 600-char
+/// documents kept most of the gain of top 30 (paraphrase top-1 19/31 vs 18/31)
+/// at ~1.2 s instead of ~5 s per query on CPU.
+const RERANK_TOP_N: usize = 10;
+
+/// Reciprocal-rank damping: the bonus halves at this BM25 rank.
+const HYBRID_RANK_DAMPING: f32 = 10.0;
+
+fn hybrid_pool() -> usize {
+    std::env::var("CSR_HYBRID_POOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(HYBRID_POOL)
+}
+
+/// Ordering bonus for a chunk at `rank` (0-based) in the BM25 list.
+/// `CSR_HYBRID_WEIGHT=0` turns the lexical signal off for A/B runs.
+fn lexical_bonus(rank: Option<usize>) -> f32 {
+    let weight = std::env::var("CSR_HYBRID_WEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(HYBRID_LEXICAL_WEIGHT);
+    rank.map_or(0.0, |r| {
+        weight * HYBRID_RANK_DAMPING / (HYBRID_RANK_DAMPING + r as f32)
+    })
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na * nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
 /// Strict 8-4-4-4-12 hex UUID shape check.
 fn is_uuid(s: &str) -> bool {
     s.len() == 36
@@ -131,18 +182,40 @@ pub async fn reflect_on_past(
 
     let search_start = Instant::now();
 
-    // Search BOTH chunks and reflections, merge by score
-    let (chunk_results, reflection_results) = {
+    // Hybrid retrieval. Vector search alone brought back the right conversation
+    // for 18 of 60 verbatim snippets of the live corpus; BM25 over chunks_fts
+    // found 56. Both pools feed one candidate list: BM25-only hits get their
+    // real cosine from the stored vector, so decay, project penalty and the
+    // displayed score treat every candidate alike, and the lexical rank only
+    // enters as an ordering bonus in the rerank below.
+    let pool = limit.max(hybrid_pool());
+    let (mut chunk_results, reflection_results) = {
         let idx = search.read().await;
         let chunks = if let Some(ref p) = effective_project {
             let ids: HashSet<String> = storage.get_chunk_ids_for_project(p)?.into_iter().collect();
-            idx.search_chunks_filtered(&query_vec, limit, min_score, &ids)
+            idx.search_chunks_filtered(&query_vec, pool, min_score, &ids)
         } else {
-            idx.search_chunks(&query_vec, limit, min_score)
+            idx.search_chunks(&query_vec, pool, min_score)
         };
         let reflections = idx.search_reflections(&query_vec, limit, min_score);
         (chunks, reflections)
     };
+    let lexical_rank: HashMap<String, usize> = storage
+        .fts5_search(query, pool, effective_project.as_deref())
+        .map(|hits| hits.into_iter().enumerate().map(|(i, c)| (c.id, i)).collect())
+        .unwrap_or_default();
+    let semantic_ids: HashSet<String> = chunk_results.iter().map(|r| r.id.clone()).collect();
+    let lexical_only: Vec<String> = lexical_rank
+        .keys()
+        .filter(|id| !semantic_ids.contains(*id))
+        .cloned()
+        .collect();
+    if !lexical_only.is_empty() {
+        for (id, vector) in storage.get_chunk_vectors_by_ids(&lexical_only)? {
+            let score = cosine_similarity(&query_vec, &vector);
+            chunk_results.push(crate::search::SearchResult { id, score });
+        }
+    }
     let search_ms = search_start.elapsed().as_millis() as u64;
 
     // Enrich chunk results with metadata
@@ -253,47 +326,6 @@ pub async fn reflect_on_past(
         }
     }
 
-    // FTS5 hybrid fallback: if semantic results are weak (top score < 0.5)
-    // or empty, supplement with keyword search results
-    let semantic_top_score = enriched.iter().map(|e| e.score).fold(0.0f32, f32::max);
-    if semantic_top_score < 0.5 {
-        let fts_project = effective_project.as_deref();
-        if let Ok(fts_chunks) = storage.fts5_search(query, limit, fts_project) {
-            let existing_ids: HashSet<String> =
-                enriched.iter().map(|e| e.chunk.id.clone()).collect();
-            for chunk in fts_chunks {
-                if existing_ids.contains(&chunk.id) {
-                    continue; // already in semantic results
-                }
-                // FTS5 results get a synthetic score slightly below semantic threshold
-                // so they rank after good semantic matches but above nothing
-                let fts_score =
-                    if let Ok(ts) = chunk.timestamp.parse::<chrono::DateTime<chrono::Utc>>() {
-                        decay::apply_decay(0.45, &ts, &now, None, None) // base 0.45 + decay
-                    } else {
-                        0.40
-                    };
-                let final_fts_score = if let Some(ref p) = effective_project {
-                    if chunk.project_name != *p {
-                        fts_score * 0.3
-                    } else {
-                        fts_score
-                    }
-                } else {
-                    fts_score
-                };
-                enriched.push(EnrichedResult {
-                    score: final_fts_score,
-                    chunk: crate::import::ConversationChunk {
-                        content: format!("[keyword] {}", chunk.content),
-                        ..chunk
-                    },
-                    resolution: None,
-                });
-            }
-        }
-    }
-
     // Provenance-aware re-rank (v9.3): authority + meaning layered on the decayed
     // score. User-authored content is boosted, tool-mechanic build-log and
     // non-user authority claims are demoted — so a founding decision out-ranks the
@@ -303,7 +335,8 @@ pub async fn reflect_on_past(
         .iter()
         .map(|e| crate::search::rerank::RankCandidate {
             id: e.chunk.id.clone(),
-            cosine: e.score,
+            // Ordering only: e.score (shown to the caller) stays the cosine.
+            cosine: e.score + lexical_bonus(lexical_rank.get(&e.chunk.id).copied()),
             content: e.chunk.content.clone(),
             provenance: storage.get_chunk_provenance(&e.chunk.id).ok().flatten(),
             timestamp: Some(e.chunk.timestamp.clone()),
@@ -315,6 +348,26 @@ pub async fn reflect_on_past(
         .collect();
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+
+    // Cross-encoder pass over the head of the fused order (opt-in).
+    if crate::embeddings::rerank::enabled() && enriched.len() > 1 {
+        let top_n = std::env::var("CSR_RERANK_TOP_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(RERANK_TOP_N);
+        let head = enriched.len().min(top_n);
+        let docs: Vec<String> = enriched[..head].iter().map(|e| e.chunk.content.clone()).collect();
+        let q = query.to_string();
+        if let Ok(Some(scores)) =
+            tokio::task::spawn_blocking(move || crate::embeddings::rerank::scores(&q, &docs)).await
+        {
+            let mut scored: Vec<(f32, EnrichedResult)> =
+                scores.into_iter().zip(enriched.drain(..head)).collect();
+            scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let tail = std::mem::take(&mut enriched);
+            enriched = scored.into_iter().map(|(_, e)| e).chain(tail).collect();
+        }
+    }
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
     // ranked plan chunk survive while its origin conversation fell outside the
@@ -980,6 +1033,24 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lexical_bonus_decays_with_bm25_rank() {
+        assert_eq!(lexical_bonus(None), 0.0);
+        let top = lexical_bonus(Some(0));
+        assert!((top - HYBRID_LEXICAL_WEIGHT).abs() < 1e-6);
+        let damped = lexical_bonus(Some(HYBRID_RANK_DAMPING as usize));
+        assert!((damped - HYBRID_LEXICAL_WEIGHT / 2.0).abs() < 1e-6);
+        assert!(lexical_bonus(Some(29)) < damped);
+    }
+
+    #[test]
+    fn cosine_similarity_is_scale_free() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [2.0, 4.0, 6.0];
+        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+        assert_eq!(cosine_similarity(&a, &[0.0, 0.0, 0.0]), 0.0);
+    }
 
     // --- exact conv-tag lookup (episode-index handle fix) ---
     // Live failure 2026-07-08: csr_reflect_on_past("conv_0b68eace-…") went
