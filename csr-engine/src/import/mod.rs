@@ -171,6 +171,9 @@ const CODEX_HARNESS_PREFIXES: &[&str] = &[
     "<skills_instructions>",
     "<collaboration_mode>",
     "<turn_aborted>",
+    // CSR's own prompt-submit hints (tools/shared-service/hook.py); Codex
+    // records hook output in the transcript, and a hint is not memory.
+    "<csr-hint>",
 ];
 
 fn is_codex_harness_text(text: &str) -> bool {

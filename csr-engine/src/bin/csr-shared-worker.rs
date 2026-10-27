@@ -23,6 +23,11 @@ async fn main() -> Result<()> {
     if std::env::var_os("CSR_GPU").is_none() {
         std::env::set_var("CSR_GPU", "directml");
     }
+    // The worker stays resident so the CPU never reloads the index, but frees
+    // the GPU memory the models hold (~2.3 GB) after 10 idle minutes.
+    if std::env::var_os("CSR_MODEL_IDLE_SECS").is_none() {
+        std::env::set_var("CSR_MODEL_IDLE_SECS", "600");
+    }
     Engine::new(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]))?
         .serve_mcp().await
 }

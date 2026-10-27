@@ -220,6 +220,13 @@ pub fn is_scaffold_text(content: &str) -> bool {
         // Compaction summaries carry the user role but are machine recitation —
         // they quote the whole prior session back, so they out-cosine origins.
         || content.contains("This session is being continued from a previous conversation")
+        // Codex harness text kept in conversations whose transcript Codex has
+        // since deleted (484 conversations live), so the importer's filter can
+        // no longer reach it: rank it down instead of losing those memories.
+        || content.contains("# AGENTS.md instructions")
+        || content.contains("<environment_context>")
+        || content.contains("<recommended_plugins>")
+        || content.contains("<codex_internal_context")
         || crate::extraction::provenance::is_csr_emission(content)
 }
 

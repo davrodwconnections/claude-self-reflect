@@ -381,6 +381,26 @@ def create_app(cfg, base):
         except Exception as e:
             return JSONResponse({"error": str(e)[:1200]}, status_code=500)
 
+    async def hint(request):
+        # Prompt-submit memory hints. Never queues behind other work: a busy
+        # worker means no hint for this prompt rather than a slow prompt.
+        try:
+            body = await request.json()
+            query = str(body.get("query", ""))[:2000]
+            if len(query.strip()) < 15:
+                return JSONResponse({"hits": []})
+            if worker.lock.locked():
+                return JSONResponse({"hits": [], "skipped": "busy"})
+            args = {"query": query, "limit": max(1, min(5, int(body.get("limit") or 2)))}
+            if body.get("exclude_conversation"):
+                args["exclude_conversation"] = str(body["exclude_conversation"])[:250]
+            result = await worker.call("csr_internal_hint", args)
+            if result.get("isError"):
+                raise RuntimeError(dump(result))
+            return JSONResponse(json.loads(result["content"][0]["text"]))
+        except Exception as e:
+            return JSONResponse({"hits": [], "error": str(e)[:300]}, status_code=500)
+
     @contextlib.asynccontextmanager
     async def lifespan(app):
         async with manager.run():
@@ -395,6 +415,7 @@ def create_app(cfg, base):
                     await worker._stop()
 
     app = Starlette(routes=[Route("/status", status), Route("/ingest", ingest, methods=["POST"]),
+        Route("/hint", hint, methods=["POST"]),
         Mount("/mcp", app=http_mcp)], lifespan=lifespan)
 
     class Auth:
