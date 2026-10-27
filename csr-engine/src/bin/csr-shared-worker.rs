@@ -13,6 +13,11 @@ async fn main() -> Result<()> {
     anyhow::ensure!(args.len() == 3, "Expected database and projects paths");
     std::env::set_var("CSR_SHARED_WORKER", "1");
     std::env::set_var("CSR_FORCE_IMPORT", "1");
+    // The shared worker reranks reflect_on_past with the multilingual
+    // cross-encoder unless the supervisor says otherwise (CSR_RERANKER=off).
+    if std::env::var_os("CSR_RERANKER").is_none() {
+        std::env::set_var("CSR_RERANKER", "jina");
+    }
     Engine::new(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]))?
         .serve_mcp().await
 }
