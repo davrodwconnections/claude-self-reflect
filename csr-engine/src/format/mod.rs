@@ -15,6 +15,21 @@ fn xml_escape(s: &str) -> String {
 /// Preview truncation length (chars, not bytes) used across all result renderers.
 pub const PREVIEW_CHARS: usize = 500;
 
+/// Abstention floor for `csr_quick_check`, calibrated for this fork's
+/// multilingual model (paraphrase-multilingual-MiniLM-L12-v2) — upstream's 0.45
+/// was measured on the English all-MiniLM-L6-v2 and does not transfer.
+///
+/// Measured 2026-10-27 on the live corpus (249,765 chunks): 12 topics verified
+/// present in `chunks_fts` scored 0.605–0.821; 12 fabricated topics (key term
+/// absent) scored 0.392–0.632. The distributions overlap, so no floor separates
+/// them. 0.58 sits below every genuine probe and suppresses 10 of 12 fabricated
+/// ones; the overlap band above it is labelled weak instead of hidden.
+pub const QUICK_CHECK_FLOOR: f32 = 0.58;
+
+/// Top of the measured overlap band (highest fabricated probe 0.632, rounded
+/// up). Below this a match is reported with an explicit may-be-spurious warning.
+pub const QUICK_CHECK_WEAK_TOP: f32 = 0.65;
+
 /// Return the longest prefix of `s` with at most `max` chars, cut on a char
 /// boundary (never panics on multi-byte UTF-8, unlike `&s[..max]` byte slicing).
 pub fn truncate_chars(s: &str, max: usize) -> &str {
@@ -247,14 +262,43 @@ pub fn format_search_results(
 }
 
 /// Format a quick check response matching the Python server output.
+///
+/// A nearest neighbour always exists, so this must be able to say no: below
+/// [`QUICK_CHECK_FLOOR`] it reports `found=false` and withholds the preview
+/// (weak-match text reads as confirmation); below [`QUICK_CHECK_WEAK_TOP`] it
+/// adds a may-be-spurious warning.
 pub fn format_quick_check(results: &[EnrichedResult], _query: &str) -> String {
     let mut out = String::new();
 
     out.push_str("<quick_search>\n");
+    let Some(top) = results.first().filter(|t| t.score >= QUICK_CHECK_FLOOR) else {
+        out.push_str("  <found>false</found>\n");
+        out.push_str("  <count>0</count>\n");
+        out.push_str("  <collections_with_matches>0</collections_with_matches>\n");
+        out.push_str(
+            "  <message>no sufficiently similar past discussion — topic likely not discussed before</message>\n",
+        );
+        if let Some(rejected) = results.first() {
+            out.push_str(&format!(
+                "  <best_rejected_score>{:.3}</best_rejected_score>\n  <floor>{:.2}</floor>\n",
+                rejected.score, QUICK_CHECK_FLOOR
+            ));
+        }
+        out.push_str("</quick_search>\n");
+        return out;
+    };
+
+    out.push_str("  <found>true</found>\n");
     out.push_str(&format!("  <count>{}</count>\n", results.len()));
     out.push_str("  <collections_with_matches>1</collections_with_matches>\n");
+    if top.score < QUICK_CHECK_WEAK_TOP {
+        out.push_str(&format!(
+            "  <warning>weak match — may be spurious. Scores in {:.2}–{:.2} overlap topics that were never discussed (fabricated probes measured up to 0.632). Read the preview before treating this as evidence the topic came up.</warning>\n",
+            QUICK_CHECK_FLOOR, QUICK_CHECK_WEAK_TOP,
+        ));
+    }
 
-    if let Some(top) = results.first() {
+    {
         out.push_str("  <top_result>\n");
         out.push_str(&format!("    <score>{:.3}</score>\n", top.score));
         out.push_str(&format!(

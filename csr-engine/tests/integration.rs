@@ -506,8 +506,46 @@ fn test_format_quick_check_structure() {
 
     let xml = format::format_quick_check(&results, "JWT auth");
     assert!(xml.contains("<quick_search>"));
+    assert!(xml.contains("<found>true</found>"));
     assert!(xml.contains("<count>1</count>"));
     assert!(xml.contains("<score>0.720</score>"));
+    assert!(!xml.contains("<warning>"), "0.72 is above the weak band");
+}
+
+fn quick_check_result(score: f32) -> Vec<EnrichedResult> {
+    vec![EnrichedResult {
+        score,
+        chunk: ConversationChunk {
+            id: "c1".into(),
+            conversation_id: "conv-1".into(),
+            project_name: "test".into(),
+            timestamp: "2026-01-15T10:00:00Z".into(),
+            content: "receta de paella".into(),
+            message_count: 2,
+            summary: None,
+            author: csr_engine::provenance::Speaker::ToolResult,
+            seq: 0,
+            is_sidechain: false,
+        },
+        resolution: None,
+    }]
+}
+
+#[test]
+fn test_quick_check_abstains_below_floor() {
+    let xml = format::format_quick_check(&quick_check_result(0.526), "paella");
+    assert!(xml.contains("<found>false</found>"));
+    assert!(xml.contains("<count>0</count>"));
+    assert!(xml.contains("<best_rejected_score>0.526</best_rejected_score>"));
+    assert!(!xml.contains("<preview>"), "weak-match preview must be withheld");
+}
+
+#[test]
+fn test_quick_check_warns_in_weak_band() {
+    let xml = format::format_quick_check(&quick_check_result(0.605), "hook");
+    assert!(xml.contains("<found>true</found>"));
+    assert!(xml.contains("<warning>weak match"));
+    assert!(xml.contains("<preview>"));
 }
 
 #[test]

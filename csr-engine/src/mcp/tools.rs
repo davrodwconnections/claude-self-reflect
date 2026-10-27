@@ -425,9 +425,13 @@ pub async fn quick_check(
         tokio::task::spawn_blocking(move || emb.embed_single(&q)).await??
     };
 
+    // Over-fetch: the HNSW index keeps vectors for chunks that were since
+    // deleted (~1% on the live corpus), so with k=1 an orphan top hit made a
+    // discussed topic report count=0. Keep the best hit that still resolves.
+    const QUICK_CHECK_FETCH: usize = 8;
     let results = {
         let idx = search.read().await;
-        idx.search_chunks(&query_vec, 1, min_score)
+        idx.search_chunks(&query_vec, QUICK_CHECK_FETCH, min_score)
     };
 
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
@@ -445,6 +449,7 @@ pub async fn quick_check(
                     resolution: None,
                 })
         })
+        .take(1)
         .collect();
 
     Ok(format::format_quick_check(&enriched, query))
