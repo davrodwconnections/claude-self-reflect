@@ -58,7 +58,9 @@ impl Engine {
         let t_embed = t0.elapsed();
 
         // Compute index cache directory alongside the database
-        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join("index");
+        let index_dir = db_path.parent().unwrap_or(Path::new(".")).join(
+            if std::env::var("CSR_SHARED_WORKER").as_deref() == Ok("1") { "shared-index" } else { "index" }
+        );
 
         // Fast O(1) counts for staleness check (~1ms)
         let chunk_count = storage.count_chunk_embeddings()?;
@@ -249,8 +251,10 @@ impl Engine {
     /// only new chunks are embedded (chunks beyond prev_count are new).
     /// Returns the number of NEW chunks imported (0 if nothing new).
     pub async fn import_file(&self, file_path: &Path, project_name: &str) -> Result<usize> {
+        let source_mtime = std::fs::metadata(file_path)?.modified()?;
         // Check if file is unchanged (mtime match = fully imported, nothing new)
-        if self.storage.is_file_imported(file_path)? {
+        if std::env::var_os("CSR_FORCE_IMPORT").is_none()
+            && self.storage.is_file_imported(file_path)? {
             return Ok(0);
         }
 
@@ -263,15 +267,39 @@ impl Engine {
             return Ok(0);
         }
 
-        // Incremental: skip chunks we already embedded
+        // Compare content, not just chunk count: an active transcript can grow
+        // inside its final chunk. Also repair partially completed earlier imports.
         let prev_count = self.storage.get_imported_chunk_count(file_path)?;
-        if chunks.len() <= prev_count {
-            // File parsed to same/fewer chunks — just update mtime
-            self.storage.mark_file_imported(file_path, chunks.len())?;
-            return Ok(0);
+        let mut new_chunks = Vec::new();
+        let mut missing_cached_ids = Vec::new();
+        for group in chunks.chunks(250) {
+            let ids: Vec<String> = group.iter().map(|c| c.id.clone()).collect();
+            let stored = self.storage.get_chunks_by_ids(&ids)?;
+            for chunk in group {
+                if let Some(old) = stored.iter().find(|old| old.id == chunk.id
+                    && old.content == chunk.content && old.message_count == chunk.message_count) {
+                    // Another process may have imported this unchanged chunk while
+                    // our index was loading (legacy-session migration). Reuse its
+                    // stored vector rather than silently missing it or re-embedding.
+                    if !self.search.read().await.has_chunk(&chunk.id) {
+                        missing_cached_ids.push(chunk.id.clone());
+                    }
+                    if old.timestamp != chunk.timestamp || old.summary != chunk.summary
+                        || old.project_name != chunk.project_name {
+                        self.storage.refresh_chunk_metadata(chunk)?;
+                    }
+                } else {
+                    new_chunks.push(chunk);
+                }
+            }
         }
-
-        let new_chunks = &chunks[prev_count..];
+        if !missing_cached_ids.is_empty() {
+            let vectors = self.storage.get_chunk_vectors_by_ids(&missing_cached_ids)?;
+            let mut idx = self.search.write().await;
+            for (id, vector) in vectors {
+                idx.insert_chunk(id, vector);
+            }
+        }
         const BATCH_SIZE: usize = 10;
 
         for batch in new_chunks.chunks(BATCH_SIZE) {
@@ -299,11 +327,15 @@ impl Engine {
                 ) {
                     eprintln!("CSR: chunk provenance persist error (non-fatal): {e}");
                 }
+                idx.remove_chunk(&chunk.id);
                 idx.insert_chunk(chunk.id.clone(), embedding);
             }
         }
 
-        self.storage.mark_file_imported(file_path, chunks.len())?;
+        // Never mark a concurrently growing transcript fully imported.
+        if std::fs::metadata(file_path)?.modified()? == source_mtime {
+            self.storage.mark_file_imported(file_path, chunks.len())?;
+        }
 
         // Layer 1: Heuristic enrichment only on first import (not incremental updates)
         if prev_count == 0 {
@@ -487,11 +519,15 @@ impl Engine {
     /// Start the MCP server on stdio with background enrichment loops.
     pub async fn serve_mcp(self) -> Result<()> {
         // Spawn enrichment loops as background tasks (extraction, narrator, consolidation)
-        let enrichment_handles = crate::daemon::spawn_enrichment_loops(
+        let enrichment_handles = if std::env::var("CSR_SHARED_WORKER").as_deref() == Ok("1") {
+            // The shared supervisor owns ingestion. Never start paid narration or
+            // untracked background writes in a worker that can be unloaded idle.
+            Vec::new()
+        } else { crate::daemon::spawn_enrichment_loops(
             self.storage.clone(),
             self.embeddings.clone(),
             self.search.clone(),
-        );
+        ) };
 
         let server = CsrServer::new(
             self.storage,

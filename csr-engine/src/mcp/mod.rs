@@ -34,6 +34,12 @@ pub struct ReflectOnPastParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SharedImportParams {
+    pub path: PathBuf,
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct StoreReflectionParams {
     /// The insight or reflection to store
     pub content: String,
@@ -234,6 +240,33 @@ impl CsrServer {
     /// so the count can't silently drift from what docs claim.
     pub fn tool_count() -> usize {
         Self::tool_router().list_all().len()
+    }
+
+    /// Export schemas without loading the model or opening the database.
+    pub fn tool_catalog() -> Vec<Tool> {
+        Self::tool_router().list_all()
+    }
+
+    #[tool(name = "csr_internal_import", description = "Private shared-worker ingestion; not exposed to agent clients.")]
+    async fn shared_import(
+        &self,
+        params: Parameters<SharedImportParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if std::env::var("CSR_SHARED_WORKER").as_deref() != Ok("1") {
+            return Err(rmcp::ErrorData::invalid_request("Shared worker only", None));
+        }
+        let p = params.0;
+        let engine = crate::engine::Engine::from_parts(
+            self.storage.clone(), self.embeddings.clone(), self.search.clone(),
+            self.projects_dir.clone(),
+        );
+        let count = engine.import_file(&p.path, &p.project).await
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        // Use this server's actual index directory (from_parts is test-oriented).
+        self.flush_index().await;
+        Ok(CallToolResult::success(vec![Content::text(
+            serde_json::json!({"path":p.path,"status":"ok","chunks_updated":count}).to_string()
+        )]))
     }
 
     /// Flush the HNSW index to disk if dirty.

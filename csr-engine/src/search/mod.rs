@@ -466,6 +466,21 @@ impl SearchEngine {
         expected_chunks: usize,
         expected_reflections: usize,
     ) -> Option<Self> {
+        // hnsw_rs asserts on malformed cache bytes instead of returning Err.
+        // SQLite remains authoritative; a corrupt disposable cache is a miss.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::load_from_disk_checked(dir, expected_chunks, expected_reflections)
+        })).unwrap_or_else(|_| {
+            tracing::warn!("corrupt HNSW cache; rebuilding from SQLite vectors");
+            None
+        })
+    }
+
+    fn load_from_disk_checked(
+        dir: &Path,
+        expected_chunks: usize,
+        expected_reflections: usize,
+    ) -> Option<Self> {
         // Acquire shared advisory lock to avoid reading while dump_to_disk is writing.
         // The File is held as _lock_guard for the duration of the load.
 

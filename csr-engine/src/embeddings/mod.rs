@@ -1,11 +1,14 @@
 pub mod cache;
 
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 use anyhow::Result;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
-/// Wraps fastembed for 384-dim paraphrase-multilingual-MiniLM-L12-v2 embeddings.
+const EMBEDDING_INTRA_THREADS: usize = 8;
+
+/// Wraps fastembed for quantized 384-dim paraphrase-multilingual-MiniLM-L12-v2
+/// embeddings.
 ///
 /// Upstream uses all-MiniLM-L6-v2, which is English-only: on a Spanish-language
 /// transcript corpus it returns scores that are both low and tightly clustered
@@ -26,7 +29,7 @@ pub struct EmbeddingEngine {
 static MODEL_INIT_LOCK: Mutex<()> = Mutex::new(());
 
 impl EmbeddingEngine {
-    /// Initialize the embedding model (downloads ~30MB on first run).
+    /// Initialize the embedding model (downloads the quantized model on first run).
     pub fn new() -> Result<Self> {
         let cache_dir = cache::cache_dir();
         std::fs::create_dir_all(&cache_dir)?;
@@ -42,9 +45,7 @@ impl EmbeddingEngine {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_secs(2 * attempt as u64));
             }
-            let options = InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2)
-                .with_cache_dir(cache_dir.clone())
-                .with_show_download_progress(true);
+            let options = embedding_init_options(cache_dir.clone());
             match TextEmbedding::try_new(options) {
                 Ok(model) => {
                     return Ok(Self {
@@ -83,5 +84,27 @@ impl EmbeddingEngine {
     /// Returns the embedding dimension (384 for all-MiniLM-L6-v2).
     pub fn dimension() -> usize {
         384
+    }
+}
+
+fn embedding_init_options(cache_dir: PathBuf) -> InitOptions {
+    InitOptions::new(EmbeddingModel::ParaphraseMLMiniLML12V2Q)
+        .with_cache_dir(cache_dir)
+        .with_intra_threads(EMBEDDING_INTRA_THREADS)
+        .with_show_download_progress(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uses_quantized_multilingual_model_with_bounded_threads() {
+        let cache_dir = PathBuf::from("test-fastembed-cache");
+        let options = embedding_init_options(cache_dir.clone());
+
+        assert_eq!(options.model_name, EmbeddingModel::ParaphraseMLMiniLML12V2Q);
+        assert_eq!(options.cache_dir, cache_dir);
+        assert_eq!(options.intra_threads, Some(8));
     }
 }

@@ -1674,10 +1674,17 @@ fn episode_v2_full_cycle_with_anchors() {
     // Transcript that modified that file via Edit + left a todo
     let transcript = [
         r#"{"type":"user","message":{"content":"fix token validation"}}"#.to_string(),
-        format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Edit","input":{{"file_path":"{}"}}}}]}}}}"#,
-            src.display()
-        ),
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "name": "Edit",
+                    "input": { "file_path": src }
+                }]
+            }
+        })
+        .to_string(),
         r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"add test","status":"pending"}]}}]}}"#.to_string(),
         r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Done, fixed."}]}}"#.to_string(),
     ];

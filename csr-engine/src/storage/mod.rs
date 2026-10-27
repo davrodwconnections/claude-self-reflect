@@ -52,6 +52,14 @@ impl Storage {
         queries::insert_chunk(&conn, chunk, embedding)
     }
 
+    /// Refresh activity metadata without recalculating an unchanged text vector.
+    pub fn refresh_chunk_metadata(&self, chunk: &ConversationChunk) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute("UPDATE chunks SET timestamp=?2, summary=?3, project_name=?4 WHERE id=?1",
+            rusqlite::params![chunk.id, chunk.timestamp, chunk.summary, chunk.project_name])?;
+        Ok(())
+    }
+
     pub fn load_all_chunk_vectors(&self) -> Result<Vec<(String, Vec<f32>)>> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::load_all_chunk_vectors(&conn)

@@ -151,6 +151,114 @@ fn is_csr_agent_prompt(first_user_message: &str) -> bool {
         .any(|sig| trimmed.starts_with(sig))
 }
 
+/// Normalize one transcript entry into the Claude-style message envelope used
+/// by the rest of CSR. Codex rollout files wrap conversational messages and
+/// tool activity in `{"type":"response_item","payload":...}`; accepting that
+/// shape here lets the existing import, extraction, and story pipelines work
+/// without maintaining a second parser.
+fn normalize_transcript_entry(parsed: serde_json::Value) -> Option<serde_json::Value> {
+    let entry_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if matches!(entry_type, "human" | "user" | "assistant" | "summary") {
+        return Some(parsed);
+    }
+    if entry_type != "response_item" {
+        return None;
+    }
+
+    let payload = parsed.get("payload")?;
+    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let timestamp = parsed.get("timestamp").cloned().unwrap_or_default();
+
+    match payload_type {
+        "message" => {
+            // Developer/system instructions are runtime plumbing, not user
+            // memory. Persist only the actual user/assistant conversation.
+            let role = payload.get("role").and_then(|v| v.as_str())?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            let content = payload
+                .get("content")
+                .and_then(|v| v.as_array())?
+                .iter()
+                .filter_map(|block| {
+                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if !matches!(block_type, "input_text" | "output_text" | "text") {
+                        return None;
+                    }
+                    let text = block.get("text").and_then(|v| v.as_str())?;
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(serde_json::json!({"type": "text", "text": text}))
+                })
+                .collect::<Vec<_>>();
+            if content.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "type": role,
+                "timestamp": timestamp,
+                "message": {"content": content}
+            }))
+        }
+        "custom_tool_call" | "function_call" => {
+            let name = payload
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let input = match payload.get("input") {
+                Some(serde_json::Value::String(raw)) => {
+                    sonic_rs::from_str::<serde_json::Value>(raw)
+                        .unwrap_or_else(|_| serde_json::json!({"raw": raw}))
+                }
+                Some(value) => value.clone(),
+                None => serde_json::json!({}),
+            };
+            Some(serde_json::json!({
+                "type": "assistant",
+                "timestamp": timestamp,
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": payload.get("call_id").or_else(|| payload.get("id")).cloned().unwrap_or_default(),
+                    "name": name,
+                    "input": input
+                }]}
+            }))
+        }
+        "custom_tool_call_output" | "function_call_output" => {
+            let output = match payload.get("output") {
+                Some(serde_json::Value::String(text)) => text.clone(),
+                Some(value) => value.to_string(),
+                None => String::new(),
+            };
+            if output.is_empty() {
+                return None;
+            }
+            // Codex tool outputs can contain multi-megabyte command transcripts.
+            // Keep enough evidence for recall while preventing a single rollout
+            // from exploding into thousands of embedding chunks.
+            const MAX_CODEX_TOOL_OUTPUT_CHARS: usize = 1000;
+            let output = if output.len() > MAX_CODEX_TOOL_OUTPUT_CHARS {
+                let end = output.floor_char_boundary(MAX_CODEX_TOOL_OUTPUT_CHARS);
+                output[..end].to_string()
+            } else {
+                output
+            };
+            Some(serde_json::json!({
+                "type": "user",
+                "timestamp": timestamp,
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": payload.get("call_id").cloned().unwrap_or_default(),
+                    "content": output
+                }]}
+            }))
+        }
+        _ => None,
+    }
+}
+
 pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<ConversationChunk>> {
     let conversation_id = path
         .file_stem()
@@ -180,6 +288,9 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
         let parsed: serde_json::Value = match sonic_rs::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,
+        };
+        let Some(parsed) = normalize_transcript_entry(parsed) else {
+            continue;
         };
 
         // Extract message type
@@ -468,6 +579,9 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        let Some(parsed) = normalize_transcript_entry(parsed) else {
+            continue;
+        };
 
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "human" || msg_type == "user" || msg_type == "assistant" {
@@ -623,6 +737,10 @@ fn extract_tool_context(msg: &serde_json::Value) -> String {
             parts.into_iter().rev().collect::<Vec<_>>().join("/")
         } else if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
             // Truncate long commands
+            let truncated: String = cmd.chars().take(120).collect();
+            truncated
+        } else if let Some(cmd) = input.get("cmd").and_then(|v| v.as_str()) {
+            // Codex exec_command uses `cmd` rather than Claude Code's `command`.
             let truncated: String = cmd.chars().take(120).collect();
             truncated
         } else if let Some(pat) = input.get("pattern").and_then(|v| v.as_str()) {
