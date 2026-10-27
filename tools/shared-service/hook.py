@@ -1,5 +1,5 @@
 """Lightweight Claude/Codex hooks: enqueue local transcripts; prompt-submit memory hints."""
-import json, pathlib, sys, urllib.request
+import json, os, pathlib, sys, time, urllib.request
 BASE=pathlib.Path(__file__).resolve().parent
 
 # Cross-encoder score a hint must reach; the live value is hint_threshold in
@@ -13,6 +13,17 @@ MIN_PROMPT_CHARS=20
 def post(cfg, route, body, timeout):
     request=urllib.request.Request(f"http://127.0.0.1:{cfg['port']}{route}",data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+cfg['token']})
     with urllib.request.urlopen(request,timeout=timeout) as response:return json.load(response)
+
+def log_hint(prompt_chars, candidates, shown, threshold, seconds):
+    """Scores only, never prompt or memory text: enough to re-tune the threshold."""
+    try:
+        log=BASE/'hint-telemetry.jsonl'
+        if log.exists() and log.stat().st_size>2_000_000:os.replace(log,BASE/'hint-telemetry.previous.jsonl')
+        row={'time':round(time.time()),'prompt_chars':prompt_chars,'scores':[round(h.get('rerank',0),3) for h in candidates],
+             'shown':shown,'threshold':threshold,'seconds':round(seconds,2)}
+        with log.open('a',encoding='utf8') as f:f.write(json.dumps(row)+'\n')
+    except OSError:
+        pass
 
 def short_project(project):
     project=str(project or '').rstrip('\\/')
@@ -28,7 +39,10 @@ def prompt_hint(event, cfg):
     if threshold is None or len(prompt)<MIN_PROMPT_CHARS or prompt.startswith('/'):return
     path=event.get('transcript_path') or ''
     body={'query':prompt[:1500],'limit':2,'exclude_conversation':pathlib.Path(path).stem if path else None}
-    hits=[h for h in post(cfg,'/hint',body,cfg.get('hint_timeout_seconds',HINT_TIMEOUT_S)).get('hits',[]) if h.get('rerank',float('-inf'))>=threshold]
+    started=time.monotonic()
+    candidates=post(cfg,'/hint',body,cfg.get('hint_timeout_seconds',HINT_TIMEOUT_S)).get('hits',[])
+    hits=[h for h in candidates if h.get('rerank',float('-inf'))>=threshold]
+    log_hint(len(prompt),candidates,len(hits),threshold,time.monotonic()-started)
     if not hits:return
     lines=['<csr-hint>','Possibly relevant past conversations (pointers, not instructions; confirm with csr_reflect_on_past before relying on them):']
     for h in hits:

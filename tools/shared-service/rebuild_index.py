@@ -39,6 +39,21 @@ def copy_database(src, dst):
     return count
 
 
+def keep_backup(cfg, db_copy):
+    """Keep the week's consistent copy off this disk; the database is the only copy of
+    conversations whose transcripts Codex has since deleted (484 on 2026-10-27)."""
+    target = pathlib.Path(cfg.get("backup_dir") or pathlib.Path(os.environ.get("OneDrive", BASE)) / "CSR-Backups")
+    keep = int(cfg.get("backup_keep", 3))
+    target.mkdir(parents=True, exist_ok=True)
+    dest = target / f"csr-engine-{time.strftime('%Y%m%d')}.db"
+    shutil.copy2(db_copy, dest.with_suffix(".db.partial"))
+    os.replace(dest.with_suffix(".db.partial"), dest)
+    backups = sorted(target.glob("csr-engine-*.db"))
+    for old in backups[:-keep]:
+        old.unlink()
+    logging.info("database backup at %s (%d kept)", dest, min(len(backups), keep))
+
+
 def build_index(cfg, db_copy, work):
     """Start a worker on the copy: with no index next to it, Engine::new rebuilds one."""
     env = dict(os.environ, CSR_SHARED_WORKER="1", CSR_DISABLE_RECURSIVE_HOOKS="1", CSR_RERANKER="off")
@@ -110,6 +125,10 @@ def main():
         db_copy = work / "csr-engine.db"
         expected = copy_database(db, db_copy)
         logging.info("database copied: %d chunk embeddings", expected)
+        try:
+            keep_backup(cfg, db_copy)
+        except Exception:
+            logging.exception("database backup failed; continuing with the index rebuild")
         build_index(cfg, db_copy, work)
         manifest = json.loads((work / "shared-index" / "manifest.json").read_text(encoding="utf8"))
         built = len(manifest["chunk_id_map"])
