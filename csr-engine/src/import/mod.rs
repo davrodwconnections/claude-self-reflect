@@ -3,6 +3,7 @@ pub mod plans;
 pub mod registry;
 pub mod watcher;
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -156,6 +157,80 @@ fn is_csr_agent_prompt(first_user_message: &str) -> bool {
 /// tool activity in `{"type":"response_item","payload":...}`; accepting that
 /// shape here lets the existing import, extraction, and story pipelines work
 /// without maintaining a second parser.
+/// Openings of the text blocks Codex itself sends in the user role: workspace
+/// instructions, environment and plugin listings, goal continuations. They are
+/// harness plumbing, not anything the user wrote, yet as user turns they were
+/// classified User and boosted by the provenance rerank (~3k chunks live).
+const CODEX_HARNESS_PREFIXES: &[&str] = &[
+    "# AGENTS.md instructions",
+    "<environment_context>",
+    "<recommended_plugins>",
+    "<codex_internal_context",
+    "<permissions instructions>",
+    "<user_instructions>",
+    "<skills_instructions>",
+    "<collaboration_mode>",
+    "<turn_aborted>",
+];
+
+fn is_codex_harness_text(text: &str) -> bool {
+    let head = text.trim_start();
+    CODEX_HARNESS_PREFIXES.iter().any(|p| head.starts_with(p))
+}
+
+/// Drops CSR's own tool calls and their results, so a session that searched
+/// memory does not re-index the recalled text as new memory. Claude logs MCP
+/// calls as named `tool_use` blocks; Codex runs them inside `exec` scripts, so
+/// an `exec` whose code calls the CSR server is dropped with its output.
+#[derive(Default)]
+pub(crate) struct CsrToolFilter {
+    suppressed_ids: HashSet<String>,
+}
+
+impl CsrToolFilter {
+    fn is_csr_call(item: &serde_json::Value) -> bool {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name.starts_with("mcp__claude-self-reflect__")
+            || name.starts_with("mcp__claude_self_reflect__")
+            || name.starts_with("csr_")
+        {
+            return true;
+        }
+        name == "exec"
+            && item.get("input").is_some_and(|input| {
+                let code = input.to_string();
+                code.contains("claude_self_reflect") || code.contains("claude-self-reflect")
+            })
+    }
+
+    /// Strips CSR blocks from `msg`; false when nothing is left to index.
+    pub(crate) fn retain(&mut self, msg: &mut serde_json::Value) -> bool {
+        let Some(items) = msg
+            .get_mut("message")
+            .and_then(|m| m.get_mut("content"))
+            .and_then(|c| c.as_array_mut())
+        else {
+            return true;
+        };
+        let before = items.len();
+        let suppressed = &mut self.suppressed_ids;
+        items.retain(|item| match item.get("type").and_then(|t| t.as_str()) {
+            Some("tool_use") if Self::is_csr_call(item) => {
+                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                    suppressed.insert(id.to_string());
+                }
+                false
+            }
+            Some("tool_result") => !item
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| suppressed.contains(id)),
+            _ => true,
+        });
+        before == 0 || !items.is_empty()
+    }
+}
+
 fn normalize_transcript_entry(parsed: serde_json::Value) -> Option<serde_json::Value> {
     let entry_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
     if matches!(entry_type, "human" | "user" | "assistant" | "summary") {
@@ -188,6 +263,9 @@ fn normalize_transcript_entry(parsed: serde_json::Value) -> Option<serde_json::V
                     }
                     let text = block.get("text").and_then(|v| v.as_str())?;
                     if text.is_empty() {
+                        return None;
+                    }
+                    if role == "user" && is_codex_harness_text(text) {
                         return None;
                     }
                     Some(serde_json::json!({"type": "text", "text": text}))
@@ -276,6 +354,7 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
 
+    let mut csr_filter = CsrToolFilter::default();
     for line_result in reader.lines() {
         let line = match line_result {
             Ok(l) => l,
@@ -289,9 +368,12 @@ pub fn parse_jsonl_file(path: &Path, project_name: &str) -> Result<Vec<Conversat
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(parsed) = normalize_transcript_entry(parsed) else {
+        let Some(mut parsed) = normalize_transcript_entry(parsed) else {
             continue;
         };
+        if !csr_filter.retain(&mut parsed) {
+            continue;
+        }
 
         // Extract message type
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -567,6 +649,7 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
 
+    let mut csr_filter = CsrToolFilter::default();
     for line_result in reader.lines() {
         let line = match line_result {
             Ok(l) => l,
@@ -579,9 +662,12 @@ pub fn parse_jsonl_messages(path: &Path) -> Result<Vec<serde_json::Value>> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(parsed) = normalize_transcript_entry(parsed) else {
+        let Some(mut parsed) = normalize_transcript_entry(parsed) else {
             continue;
         };
+        if !csr_filter.retain(&mut parsed) {
+            continue;
+        }
 
         let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
         if msg_type == "human" || msg_type == "user" || msg_type == "assistant" {
@@ -771,6 +857,78 @@ fn generate_chunk_id(conversation_id: &str, chunk_index: usize) -> String {
 mod tests {
     use super::*;
     use crate::provenance::Speaker;
+
+    fn parse_lines(lines: &[serde_json::Value]) -> Vec<ConversationChunk> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conv-filter.jsonl");
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        parse_jsonl_file(&path, "test").unwrap()
+    }
+
+    fn all_text(chunks: &[ConversationChunk]) -> String {
+        chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn codex_harness_user_blocks_are_not_indexed() {
+        let chunks = parse_lines(&[
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:00Z",
+                "payload": {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "# AGENTS.md instructions for D:\\repo\n<INSTRUCTIONS>be terse</INSTRUCTIONS>"},
+                    {"type": "input_text", "text": "<environment_context>cwd=D:\\repo</environment_context>"}]}}),
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:01Z",
+                "payload": {"type": "message", "role": "user", "content": [
+                    {"type": "input_text", "text": "arregla el bug del calendario de turnos"}]}}),
+        ]);
+        let text = all_text(&chunks);
+        assert!(text.contains("calendario de turnos"));
+        assert!(!text.contains("AGENTS.md"));
+        assert!(!text.contains("environment_context"));
+    }
+
+    #[test]
+    fn claude_csr_tool_calls_and_results_are_not_indexed() {
+        let chunks = parse_lines(&[
+            serde_json::json!({"type": "user", "timestamp": "2026-10-27T10:00:00Z",
+                "message": {"content": [{"type": "text", "text": "qué decidimos del Time Off"}]}}),
+            serde_json::json!({"type": "assistant", "timestamp": "2026-10-27T10:00:01Z",
+                "message": {"content": [{"type": "tool_use", "id": "toolu_1",
+                    "name": "mcp__claude-self-reflect__csr_reflect_on_past",
+                    "input": {"query": "Time Off"}}]}}),
+            serde_json::json!({"type": "user", "timestamp": "2026-10-27T10:00:02Z",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1",
+                    "content": "RECALLED nadie aprueba su propio Time Off"}]}}),
+            serde_json::json!({"type": "assistant", "timestamp": "2026-10-27T10:00:03Z",
+                "message": {"content": [{"type": "text", "text": "Lo decidimos en agosto."}]}}),
+        ]);
+        let text = all_text(&chunks);
+        assert!(text.contains("qué decidimos del Time Off"));
+        assert!(text.contains("Lo decidimos en agosto."));
+        assert!(!text.contains("RECALLED"), "CSR's own result must not be re-indexed");
+        assert!(!text.contains("csr_reflect_on_past"));
+    }
+
+    #[test]
+    fn codex_exec_calling_csr_is_dropped_with_its_output() {
+        let chunks = parse_lines(&[
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:00Z",
+                "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "call_csr",
+                    "input": "text(await tools.mcp__claude_self_reflect__csr_reflect_on_past({query:'x'}))"}}),
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:01Z",
+                "payload": {"type": "custom_tool_call_output", "call_id": "call_csr",
+                    "output": "Script completed\nRECALLED old search results"}}),
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:02Z",
+                "payload": {"type": "custom_tool_call", "name": "exec", "call_id": "call_build",
+                    "input": "text(await tools.exec_command({cmd:'pnpm build'}))"}}),
+            serde_json::json!({"type": "response_item", "timestamp": "2026-10-27T10:00:03Z",
+                "payload": {"type": "custom_tool_call_output", "call_id": "call_build",
+                    "output": "BUILD OK in 12s"}}),
+        ]);
+        let text = all_text(&chunks);
+        assert!(!text.contains("RECALLED"));
+        assert!(text.contains("BUILD OK"), "unrelated exec output is kept");
+    }
 
     #[test]
     fn classify_assistant_message() {

@@ -574,6 +574,16 @@ impl Storage {
         queries::delete_chunks_for_conversation(&conn, conversation_id)
     }
 
+    /// See `queries::delete_conversation_chunks_except`.
+    pub fn delete_conversation_chunks_except(
+        &self,
+        conversation_id: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<Vec<String>> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        queries::delete_conversation_chunks_except(&conn, conversation_id, keep)
+    }
+
     pub fn record_narrative_usage(&self, row: &NarrativeUsageRow) -> Result<()> {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
         queries::record_narrative_usage(&conn, row)

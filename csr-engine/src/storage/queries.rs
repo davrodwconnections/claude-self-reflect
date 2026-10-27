@@ -217,6 +217,35 @@ pub fn get_chunk_source(conn: &Connection, id: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
+/// Delete the chunks of `conversation_id` whose id is not in `keep`, with their
+/// embeddings, FTS rows and provenance, and return the deleted ids. A re-import
+/// that parses to fewer chunks than before (harness and CSR blocks are now
+/// dropped) would otherwise leave the old tail searchable forever.
+pub fn delete_conversation_chunks_except(
+    conn: &Connection,
+    conversation_id: &str,
+    keep: &std::collections::HashSet<String>,
+) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT id FROM chunks WHERE conversation_id = ?1")?;
+    let stale: Vec<String> = stmt
+        .query_map(params![conversation_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|id| !keep.contains(id))
+        .collect();
+    drop(stmt);
+    for id in &stale {
+        conn.execute(
+            "DELETE FROM chunks_fts WHERE rowid = (SELECT rowid FROM chunks WHERE id = ?1)",
+            params![id],
+        )?;
+        conn.execute("DELETE FROM chunk_embeddings WHERE chunk_id = ?1", params![id])?;
+        conn.execute("DELETE FROM chunk_provenance WHERE chunk_id = ?1", params![id])?;
+        conn.execute("DELETE FROM chunks WHERE id = ?1", params![id])?;
+    }
+    Ok(stale)
+}
+
 /// Delete a whole conversation's chunks + their embeddings, FTS rows, and provenance
 /// edges. Aux-source adapters (plans, tasks, ...) reimport a whole document on content
 /// change, and the document can shrink — overwriting by deterministic chunk id alone

@@ -259,6 +259,23 @@ impl Engine {
         }
 
         let chunks = import::parse_jsonl_file(file_path, project_name)?;
+        // Chunks this parse no longer produces (the importer now drops harness
+        // and CSR blocks, so a re-import can shrink) are deleted, not left stale.
+        let conversation_id = file_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let keep: std::collections::HashSet<String> = chunks.iter().map(|c| c.id.clone()).collect();
+        let stale = self
+            .storage
+            .delete_conversation_chunks_except(&conversation_id, &keep)?;
+        if !stale.is_empty() {
+            let mut idx = self.search.write().await;
+            for id in &stale {
+                idx.remove_chunk(id);
+            }
+        }
         if chunks.is_empty() {
             // Record the skip (agent transcripts, empty conversations) so the
             // watcher doesn't re-parse the file every pass and import_percent

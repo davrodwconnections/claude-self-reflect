@@ -155,27 +155,26 @@ fn lookup_by_conv_tag(
     )))
 }
 
-/// Full semantic search with rich XML results.
-pub async fn reflect_on_past(
+/// Candidates for `query` in final order: hybrid vector + BM25 retrieval,
+/// decay, project penalty, provenance rerank and the optional cross-encoder.
+/// Shared by reflect_on_past and memory_hint so both see the same ranking.
+pub(crate) struct Ranked {
+    pub enriched: Vec<EnrichedResult>,
+    /// Cross-encoder score per chunk id, for the reranked head only.
+    pub rerank_scores: HashMap<String, f32>,
+    pub embed_ms: u64,
+    pub search_ms: u64,
+}
+
+pub(crate) async fn rank_for_query(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
     query: &str,
     limit: usize,
     min_score: f32,
-    project: Option<&str>,
-) -> Result<String> {
-    // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
-    // exact tag. Falls through to semantic search only when the tag matches
-    // nothing, so a stale handle still gets a best-effort answer.
-    if let Some(conv_id) = extract_conv_id(query) {
-        if let Some(result) = lookup_by_conv_tag(storage, conv_id, query, limit.max(5))? {
-            return Ok(result);
-        }
-    }
-
-    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
-
+    effective_project: Option<String>,
+) -> Result<Ranked> {
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
     let embed_ms = embed_start.elapsed().as_millis() as u64;
@@ -349,6 +348,7 @@ pub async fn reflect_on_past(
     let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
     enriched.sort_by_key(|e| rank_of(&e.chunk.id));
 
+    let mut rerank_scores: HashMap<String, f32> = HashMap::new();
     // Cross-encoder pass over the head of the fused order (opt-in).
     if crate::embeddings::rerank::enabled() && enriched.len() > 1 {
         let top_n = std::env::var("CSR_RERANK_TOP_N")
@@ -361,6 +361,9 @@ pub async fn reflect_on_past(
         if let Ok(Some(scores)) =
             tokio::task::spawn_blocking(move || crate::embeddings::rerank::scores(&q, &docs)).await
         {
+            for (score, e) in scores.iter().zip(&enriched[..head]) {
+                rerank_scores.insert(e.chunk.id.clone(), *score);
+            }
             let mut scored: Vec<(f32, EnrichedResult)> =
                 scores.into_iter().zip(enriched.drain(..head)).collect();
             scored.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -368,6 +371,46 @@ pub async fn reflect_on_past(
             enriched = scored.into_iter().map(|(_, e)| e).chain(tail).collect();
         }
     }
+
+    Ok(Ranked {
+        enriched,
+        rerank_scores,
+        embed_ms,
+        search_ms,
+    })
+}
+
+/// Full semantic search with rich XML results.
+pub async fn reflect_on_past(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    limit: usize,
+    min_score: f32,
+    project: Option<&str>,
+) -> Result<String> {
+    // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
+    // exact tag. Falls through to semantic search only when the tag matches
+    // nothing, so a stale handle still gets a best-effort answer.
+    if let Some(conv_id) = extract_conv_id(query) {
+        if let Some(result) = lookup_by_conv_tag(storage, conv_id, query, limit.max(5))? {
+            return Ok(result);
+        }
+    }
+
+    let (effective_project, scope_label) = cross_project::normalize_project_scope(project);
+
+    let Ranked { mut enriched, embed_ms, search_ms, .. } = rank_for_query(
+        storage,
+        embeddings,
+        search,
+        query,
+        limit,
+        min_score,
+        effective_project,
+    )
+    .await?;
 
     // Dedupe BEFORE the limit cut (CodeRabbit): truncating first let a higher-
     // ranked plan chunk survive while its origin conversation fell outside the
@@ -406,6 +449,63 @@ pub async fn reflect_on_past(
         search_ms,
         embed_ms,
     ))
+}
+
+/// Candidates the hint ranks before picking one chunk per conversation.
+const HINT_POOL: usize = 10;
+
+/// Preview length (chars) of each hint.
+const HINT_PREVIEW_CHARS: usize = 240;
+
+/// Past conversations most relevant to a prompt, for prompt-submit hooks.
+///
+/// Returns at most `limit` hits, one per conversation, each with the
+/// cross-encoder score the caller thresholds on; only the reranked head
+/// carries a score, so with reranking off the list is empty. The current
+/// conversation is excluded, and hints are not logged as retrieval events —
+/// they are offers, not recalls the caller acted on.
+pub async fn memory_hint(
+    storage: &Arc<Storage>,
+    embeddings: &Arc<EmbeddingEngine>,
+    search: &Arc<RwLock<SearchEngine>>,
+    query: &str,
+    exclude_conversation: Option<&str>,
+    limit: usize,
+) -> Result<serde_json::Value> {
+    let ranked = rank_for_query(storage, embeddings, search, query, HINT_POOL, 0.0, None).await?;
+    let mut seen: HashSet<String> = HashSet::new();
+    if let Some(conv) = exclude_conversation {
+        seen.insert(conv.to_string());
+    }
+    let hits: Vec<serde_json::Value> = ranked
+        .enriched
+        .iter()
+        .filter_map(|e| {
+            let rerank = *ranked.rerank_scores.get(&e.chunk.id)?;
+            if !seen.insert(e.chunk.conversation_id.clone()) {
+                return None;
+            }
+            let preview: String = format::truncate_chars(&e.chunk.content, HINT_PREVIEW_CHARS)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(serde_json::json!({
+                "conversation_id": e.chunk.conversation_id,
+                "project": e.chunk.project_name,
+                "timestamp": e.chunk.timestamp,
+                "cosine": e.score,
+                "rerank": rerank,
+                "preview": preview,
+            }))
+        })
+        .take(limit)
+        .collect();
+    Ok(serde_json::json!({
+        "hits": hits,
+        "reranked": crate::embeddings::rerank::enabled(),
+        "embed_ms": ranked.embed_ms,
+        "search_ms": ranked.search_ms,
+    }))
 }
 
 /// Store a reflection with embedding for future search.

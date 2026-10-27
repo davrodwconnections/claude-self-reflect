@@ -40,6 +40,16 @@ pub struct SharedImportParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct SharedHintParams {
+    /// The user's prompt.
+    pub query: String,
+    /// Conversation the prompt belongs to, left out of the hints.
+    pub exclude_conversation: Option<String>,
+    /// Maximum hits (default 2).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct StoreReflectionParams {
     /// The insight or reflection to store
     pub content: String,
@@ -267,6 +277,28 @@ impl CsrServer {
         Ok(CallToolResult::success(vec![Content::text(
             serde_json::json!({"path":p.path,"status":"ok","chunks_updated":count}).to_string()
         )]))
+    }
+
+    #[tool(name = "csr_internal_hint", description = "Private shared-worker memory hints for prompt hooks; not exposed to agent clients.")]
+    async fn shared_hint(
+        &self,
+        params: Parameters<SharedHintParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        if std::env::var("CSR_SHARED_WORKER").as_deref() != Ok("1") {
+            return Err(rmcp::ErrorData::invalid_request("Shared worker only", None));
+        }
+        let p = params.0;
+        let hints = tools::memory_hint(
+            &self.storage,
+            &self.embeddings,
+            &self.search,
+            &p.query,
+            p.exclude_conversation.as_deref(),
+            p.limit.unwrap_or(2).clamp(1, 5),
+        )
+        .await
+        .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(hints.to_string())]))
     }
 
     /// Flush the HNSW index to disk if dirty.

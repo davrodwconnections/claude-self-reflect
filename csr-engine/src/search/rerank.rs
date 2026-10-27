@@ -182,6 +182,13 @@ const MECHANIC_MARKERS: &[&str] = &[
     "[Tool:",
     "[MultiEdit:",
     "[Grep:",
+    // Codex runs tools through `exec` scripts; its outputs carry these headers.
+    // A third of all Codex chunks (39k live) were raw command output.
+    "[exec",
+    "Script completed",
+    "Wall time",
+    "Original token count",
+    "Process exited with code",
 ];
 
 /// A chunk is mechanic if it *leads* with a tool marker OR is mechanic-dominated

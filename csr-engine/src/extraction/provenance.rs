@@ -68,7 +68,7 @@ const EMISSION_HEADERS: [&str; 14] = [
 /// Case-sensitive on purpose: our emissions are uppercase-exact; genuine prose
 /// ("next: fix the todos counter") is not. One token can occur in real text;
 /// two or more distinct tokens means the text is echoing our format.
-const EMISSION_FIELD_TOKENS: [&str; 8] = [
+const EMISSION_FIELD_TOKENS: [&str; 12] = [
     "LAST:",
     "NEXT:",
     "TODOS:",
@@ -77,6 +77,11 @@ const EMISSION_FIELD_TOKENS: [&str; 8] = [
     "Past session [",
     "(outcome=",
     "csr_reflect_on_past(",
+    // Shared-service result markup, re-indexed when a session quoted a search.
+    "<excerpt><![CDATA[",
+    "</cid>",
+    "<quick_search>",
+    "🎯 RESULTS:",
 ];
 
 /// Claude Code transcript wrapper tags. Their contents are command plumbing or
