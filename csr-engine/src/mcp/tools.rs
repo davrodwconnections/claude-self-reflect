@@ -579,14 +579,24 @@ pub async fn resolve_chunks(
 }
 
 /// Quick existence check — count + top match only.
+///
+/// Two retrievals on purpose. The abstention floor (`QUICK_CHECK_FLOOR`) was
+/// calibrated on the raw cosine of the vector-only nearest neighbour, so that
+/// probe still decides *whether* the topic exists. The preview, though, comes
+/// from the same hybrid BM25 + provenance ranking as `reflect_on_past`, so an
+/// exact keyword hit or the user's own words beat a vaguely similar paragraph
+/// (the live probe «memory hub laptop server Tailscale» previewed a game-server
+/// chunk at 0.682 while the laptop-server memory text sat lower in cosine).
 pub async fn quick_check(
     storage: &Arc<Storage>,
     embeddings: &Arc<EmbeddingEngine>,
     search: &Arc<RwLock<SearchEngine>>,
     query: &str,
     min_score: f32,
+    project: Option<&str>,
     include_tool_output: bool,
 ) -> Result<String> {
+    let (effective_project, _scope_label) = cross_project::normalize_project_scope(project);
     let query_vec = {
         let q = query.to_string();
         let emb = embeddings.clone();
@@ -601,13 +611,19 @@ pub async fn quick_check(
     let fetch = QUICK_CHECK_FETCH * if include_tool_output { 1 } else { 2 };
     let results = {
         let idx = search.read().await;
-        idx.search_chunks(&query_vec, fetch, min_score)
+        match &effective_project {
+            Some(p) => {
+                let ids: HashSet<String> =
+                    storage.get_chunk_ids_for_project(p)?.into_iter().collect();
+                idx.search_chunks_filtered(&query_vec, fetch, min_score, &ids)
+            }
+            None => idx.search_chunks(&query_vec, fetch, min_score),
+        }
     };
 
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
     let chunks = storage.get_chunks_by_ids_with_provenance(&ids)?;
-
-    let enriched: Vec<EnrichedResult> = results
+    let probe: Option<EnrichedResult> = results
         .iter()
         .filter_map(|r| {
             chunks
@@ -622,10 +638,55 @@ pub async fn quick_check(
                     resolution: None,
                 })
         })
-        .take(1)
-        .collect();
+        .next();
 
-    Ok(format::format_quick_check(&enriched, query))
+    // Only pay for the hybrid ranking when there is something to preview.
+    let hybrid_top = if probe
+        .as_ref()
+        .is_some_and(|p| p.score >= format::QUICK_CHECK_FLOOR)
+    {
+        rank_for_query(
+            storage,
+            embeddings,
+            search,
+            query,
+            1,
+            min_score,
+            effective_project,
+            include_tool_output,
+        )
+        .await?
+        .enriched
+        .into_iter()
+        .next()
+    } else {
+        None
+    };
+
+    Ok(format::format_quick_check(&quick_check_pick(probe, hybrid_top), query))
+}
+
+/// What `quick_check` reports: the vector probe decides existence (its raw
+/// cosine is what the floor was calibrated on), the hybrid-ranked top supplies
+/// the preview. Below the floor the probe itself is returned so the formatter
+/// can abstain and show `best_rejected_score`.
+pub(crate) fn quick_check_pick(
+    probe: Option<EnrichedResult>,
+    hybrid_top: Option<EnrichedResult>,
+) -> Vec<EnrichedResult> {
+    let Some(probe) = probe else {
+        return Vec::new();
+    };
+    if probe.score < format::QUICK_CHECK_FLOOR {
+        return vec![probe];
+    }
+    match hybrid_top {
+        Some(mut top) => {
+            top.score = probe.score;
+            vec![top]
+        }
+        None => vec![probe],
+    }
 }
 
 /// Search insights — aggregated summary without individual results.
@@ -1153,6 +1214,35 @@ pub fn apply_resolutions(enriched: &mut Vec<EnrichedResult>, storage: &Arc<Stora
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn qc(id: &str, score: f32) -> EnrichedResult {
+        EnrichedResult {
+            score,
+            chunk: crate::import::ConversationChunk {
+                id: id.into(), conversation_id: id.into(), project_name: "p".into(),
+                timestamp: "2026-11-02T00:00:00Z".into(), content: id.into(), message_count: 1,
+                summary: None, author: crate::provenance::Speaker::User, seq: 0, is_sidechain: false,
+            },
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn quick_check_pick_keeps_probe_confidence_and_hybrid_preview() {
+        // Probe above the floor: the hybrid-ranked chunk is previewed, but the
+        // reported score stays the vector-probe confidence the floor was calibrated on.
+        let picked = quick_check_pick(Some(qc("probe", 0.70)), Some(qc("hybrid", 0.41)));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].chunk.id, "hybrid");
+        assert!((picked[0].score - 0.70).abs() < 1e-6);
+        // Probe below the floor: abstain with the probe itself (format shows best_rejected_score).
+        let picked = quick_check_pick(Some(qc("probe", 0.50)), Some(qc("hybrid", 0.9)));
+        assert_eq!(picked[0].chunk.id, "probe");
+        // No probe at all: nothing.
+        assert!(quick_check_pick(None, Some(qc("hybrid", 0.9))).is_empty());
+        // Probe passes but hybrid ranking came back empty: fall back to the probe.
+        assert_eq!(quick_check_pick(Some(qc("probe", 0.70)), None)[0].chunk.id, "probe");
+    }
 
     #[test]
     fn lexical_bonus_decays_with_bm25_rank() {

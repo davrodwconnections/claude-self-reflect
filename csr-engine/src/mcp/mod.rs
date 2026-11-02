@@ -442,6 +442,7 @@ impl CsrServer {
             &self.search,
             &p.query,
             min_score,
+            p.project.as_deref(),
             p.include_tool_output.unwrap_or(false),
         )
         .await;

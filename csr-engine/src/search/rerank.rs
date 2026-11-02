@@ -206,6 +206,10 @@ const MECHANIC_MARKERS: &[&str] = &[
     "Wall time",
     "Original token count",
     "Process exited with code",
+    // T3 context handoffs quote the prior transcript into one user message as
+    // numbered `[NN] tool exec call:` / `tool exec result:` lines (2026-11-02).
+    "tool exec call:",
+    "tool exec result:",
 ];
 
 /// A chunk is mechanic if it *leads* with a tool marker OR is mechanic-dominated
@@ -244,6 +248,10 @@ pub fn is_scaffold_text(content: &str) -> bool {
         || content.contains("<environment_context>")
         || content.contains("<recommended_plugins>")
         || content.contains("<codex_internal_context")
+        // T3 provider handoffs: the whole previous thread recited as one user message.
+        || content.contains("Context handoff (")
+        || content.contains("Provider context handoff")
+        || (content.contains("tool exec call:") && content.contains("tool exec result:"))
         || crate::extraction::provenance::is_csr_emission(content)
 }
 
@@ -349,6 +357,31 @@ mod tests {
         ]);
         let ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["user", "refl", "assistant-log"]);
+    }
+
+    /// A T3 context handoff quotes the whole prior transcript into ONE user-role
+    /// message (`[66] tool exec call: …`, `[67] tool exec result: …`). It is
+    /// recitation, not authorship: W_USER must not lift it over honest content.
+    fn handoff_transcript(id: &str, cosine: f32) -> RankCandidate {
+        RankCandidate {
+            timestamp: None,
+            id: id.into(),
+            cosine,
+            content: "[66] tool exec call: const r = await tools.exec_command({cmd: \"rg backdoor\"});\n\n[67] tool exec result: Script completed\nWall time 0.8 seconds\nOutput:\n\n[68] tool exec call: const r = await tools.exec_command({cmd: \"rg --files\"});".into(),
+            provenance: Some(ChunkProvenance {
+                author: Speaker::User,
+                source_conv_id: "handoff".into(),
+                supersedes: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn handoff_transcript_ranks_below_honest_user_text_at_equal_cosine() {
+        let ranked = rerank(vec![handoff_transcript("handoff", 0.5), user_decision("user", 0.5)]);
+        assert_eq!(ranked[0].id, "user");
+        assert!(adjusted_score(&handoff_transcript("h", 0.5)) < adjusted_score(&user_decision("u", 0.5)) - 0.5,
+            "a quoted exec transcript must lose both the mechanic and the scaffold penalty");
     }
 
     #[test]

@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameter is true. The mechanic penalty only saw text markers, so `[Read:]` file
   dumps and JSON results sailed through. The candidate pool doubles when excluding;
   reflections and episodes (no provenance row) stay. `csr_why` is unchanged.
+- **FIX: context-handoff transcripts no longer pose as the user's words.** T3
+  provider handoffs quote the previous thread into one user-role message as
+  numbered `[NN] tool exec call:` / `tool exec result:` lines; they now trip the
+  mechanic and scaffold penalties instead of collecting the user authority boost.
+- **CHANGE: `csr_quick_check` previews the hybrid-ranked top.** The vector probe
+  still decides existence against the calibrated floor (0.58/0.65); the preview
+  comes from the same BM25 + provenance ranking as `csr_reflect_on_past`, and the
+  `project` parameter is now honoured (the MCP accepted it but ignored it).
 - **FIX: `chunks_fts` drift is repaired on every open where row counts disagree**,
   not only once (3,001 orphan rows had reappeared; 2,922 removed on first start).
 
