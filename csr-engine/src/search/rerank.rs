@@ -172,6 +172,23 @@ pub fn rerank_with(mut cands: Vec<RankCandidate>, policy: RankPolicy) -> Vec<Ran
     cands
 }
 
+/// Normal recall shows what people said, not what tools printed. The mechanic
+/// penalty only fires on text markers, so a `[Read:]` file dump or a JSON tool
+/// result (52.6 % of the live corpus on 2026-11-02 was `tool_result`-authored)
+/// sailed through and buried the user's own words. Drops every candidate whose
+/// provenance author is `tool_result`; candidates without a provenance row
+/// (reflections, episodes, chunks not yet enriched) are kept.
+pub fn without_tool_output(cands: Vec<RankCandidate>) -> Vec<RankCandidate> {
+    cands
+        .into_iter()
+        .filter(|c| {
+            c.provenance
+                .as_ref()
+                .is_none_or(|p| p.author != Speaker::ToolResult)
+        })
+        .collect()
+}
+
 /// Tool-mechanic markers: `[Edit: ...]`, `[Bash: ...]`, etc. These index *what
 /// was done mechanically*, not *what was meant*.
 const MECHANIC_MARKERS: &[&str] = &[
@@ -293,6 +310,45 @@ mod tests {
                 supersedes: None,
             }),
         }
+    }
+
+    /// Tool output with no mechanic marker: a `[Read:]` file dump or a JSON
+    /// result. The mechanic penalty never sees it, so author is the only signal.
+    fn unmarked_tool_output(id: &str, cosine: f32) -> RankCandidate {
+        RankCandidate {
+            timestamp: None,
+            id: id.into(),
+            cosine,
+            content: "1\t---\n2\tname: project-laptop-server\n3\tdescription: the laptop is the server".into(),
+            provenance: Some(ChunkProvenance {
+                author: Speaker::ToolResult,
+                source_conv_id: "dump".into(),
+                supersedes: None,
+            }),
+        }
+    }
+
+    fn reflection(id: &str, cosine: f32) -> RankCandidate {
+        RankCandidate {
+            timestamp: None,
+            id: id.into(),
+            cosine,
+            content: "[reflection] the laptop became the server on 2026-11-01".into(),
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn without_tool_output_drops_tool_results_and_keeps_people_and_reflections() {
+        let kept = without_tool_output(vec![
+            unmarked_tool_output("dump", 0.9),
+            poison("hostile", 0.85),
+            user_decision("user", 0.5),
+            reflection("refl", 0.4),
+            mechanic("assistant-log", 0.3),
+        ]);
+        let ids: Vec<&str> = kept.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["user", "refl", "assistant-log"]);
     }
 
     #[test]

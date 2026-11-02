@@ -32,6 +32,9 @@ pub struct ReflectOnPastParams {
     pub min_score: Option<f32>,
     /// Search specific project only, or 'all' for cross-project
     pub project: Option<String>,
+    /// Also return tool output (command results, file dumps). Default false:
+    /// normal recall shows what people said.
+    pub include_tool_output: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -66,6 +69,8 @@ pub struct QuickCheckParams {
     pub min_score: Option<f32>,
     /// Search specific project only, or 'all' for cross-project
     pub project: Option<String>,
+    /// Also consider tool output (command results, file dumps). Default false.
+    pub include_tool_output: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -365,6 +370,7 @@ impl CsrServer {
             limit,
             min_score,
             p.project.as_deref(),
+            p.include_tool_output.unwrap_or(false),
         )
         .await;
 
@@ -436,6 +442,7 @@ impl CsrServer {
             &self.search,
             &p.query,
             min_score,
+            p.include_tool_output.unwrap_or(false),
         )
         .await;
 

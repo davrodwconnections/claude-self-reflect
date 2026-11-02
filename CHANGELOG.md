@@ -5,6 +5,19 @@ All notable changes to Claude Self-Reflect will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - fork `backport/9.4.1-fixes`
+
+### Recall shows what people said, not what tools printed
+
+- **CHANGE: tool output out of normal recall.** `tool_result`-authored chunks
+  (52.6 % of the live corpus on 2026-11-02) are dropped from `csr_reflect_on_past`,
+  `csr_quick_check` and the `memory_hint` hook unless the new `include_tool_output`
+  parameter is true. The mechanic penalty only saw text markers, so `[Read:]` file
+  dumps and JSON results sailed through. The candidate pool doubles when excluding;
+  reflections and episodes (no provenance row) stay. `csr_why` is unchanged.
+- **FIX: `chunks_fts` drift is repaired on every open where row counts disagree**,
+  not only once (3,001 orphan rows had reappeared; 2,922 removed on first start).
+
 ## [9.4.1] - 2026-07-28
 
 ### Self-hosting hygiene: hook cancellation, recursion, and corpus contamination

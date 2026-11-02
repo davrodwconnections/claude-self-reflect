@@ -174,6 +174,7 @@ pub(crate) async fn rank_for_query(
     limit: usize,
     min_score: f32,
     effective_project: Option<String>,
+    include_tool_output: bool,
 ) -> Result<Ranked> {
     let embed_start = Instant::now();
     let query_vec = embed_query(embeddings, query).await?;
@@ -187,7 +188,9 @@ pub(crate) async fn rank_for_query(
     // real cosine from the stored vector, so decay, project penalty and the
     // displayed score treat every candidate alike, and the lexical rank only
     // enters as an ordering bonus in the rerank below.
-    let pool = limit.max(hybrid_pool());
+    // Half the live corpus is tool output; when it is excluded below, fetch
+    // twice as many candidates so the page still fills.
+    let pool = limit.max(hybrid_pool()) * if include_tool_output { 1 } else { 2 };
     let (mut chunk_results, reflection_results) = {
         let idx = search.read().await;
         let chunks = if let Some(ref p) = effective_project {
@@ -341,12 +344,20 @@ pub(crate) async fn rank_for_query(
             timestamp: Some(e.chunk.timestamp.clone()),
         })
         .collect();
+    // Normal recall drops tool output entirely (opt back in with
+    // `include_tool_output`); reflections carry no provenance row and stay.
+    let candidates = if include_tool_output {
+        candidates
+    } else {
+        crate::search::rerank::without_tool_output(candidates)
+    };
     let order: Vec<String> = crate::search::rerank::rerank(candidates)
         .into_iter()
         .map(|c| c.id)
         .collect();
-    let rank_of = |id: &str| order.iter().position(|x| x == id).unwrap_or(usize::MAX);
-    enriched.sort_by_key(|e| rank_of(&e.chunk.id));
+    let rank_of = |id: &str| order.iter().position(|x| x == id);
+    enriched.retain(|e| rank_of(&e.chunk.id).is_some());
+    enriched.sort_by_key(|e| rank_of(&e.chunk.id).unwrap_or(usize::MAX));
 
     let mut rerank_scores: HashMap<String, f32> = HashMap::new();
     // Cross-encoder pass over the head of the fused order (opt-in).
@@ -389,6 +400,7 @@ pub async fn reflect_on_past(
     limit: usize,
     min_score: f32,
     project: Option<&str>,
+    include_tool_output: bool,
 ) -> Result<String> {
     // Retrieval-handle fast path: `conv_<uuid>` (or a bare UUID) resolves by
     // exact tag. Falls through to semantic search only when the tag matches
@@ -409,6 +421,7 @@ pub async fn reflect_on_past(
         limit,
         min_score,
         effective_project,
+        include_tool_output,
     )
     .await?;
 
@@ -472,7 +485,8 @@ pub async fn memory_hint(
     exclude_conversation: Option<&str>,
     limit: usize,
 ) -> Result<serde_json::Value> {
-    let ranked = rank_for_query(storage, embeddings, search, query, HINT_POOL, 0.0, None).await?;
+    let ranked =
+        rank_for_query(storage, embeddings, search, query, HINT_POOL, 0.0, None, false).await?;
     let mut seen: HashSet<String> = HashSet::new();
     if let Some(conv) = exclude_conversation {
         seen.insert(conv.to_string());
@@ -571,6 +585,7 @@ pub async fn quick_check(
     search: &Arc<RwLock<SearchEngine>>,
     query: &str,
     min_score: f32,
+    include_tool_output: bool,
 ) -> Result<String> {
     let query_vec = {
         let q = query.to_string();
@@ -581,14 +596,16 @@ pub async fn quick_check(
     // Over-fetch: the HNSW index keeps vectors for chunks that were since
     // deleted (~1% on the live corpus), so with k=1 an orphan top hit made a
     // discussed topic report count=0. Keep the best hit that still resolves.
+    // Excluding tool output (half the corpus) doubles the over-fetch.
     const QUICK_CHECK_FETCH: usize = 8;
+    let fetch = QUICK_CHECK_FETCH * if include_tool_output { 1 } else { 2 };
     let results = {
         let idx = search.read().await;
-        idx.search_chunks(&query_vec, QUICK_CHECK_FETCH, min_score)
+        idx.search_chunks(&query_vec, fetch, min_score)
     };
 
     let ids: Vec<String> = results.iter().map(|r| r.id.clone()).collect();
-    let chunks = storage.get_chunks_by_ids(&ids)?;
+    let chunks = storage.get_chunks_by_ids_with_provenance(&ids)?;
 
     let enriched: Vec<EnrichedResult> = results
         .iter()
@@ -596,6 +613,9 @@ pub async fn quick_check(
             chunks
                 .iter()
                 .find(|c| c.id == r.id)
+                .filter(|c| {
+                    include_tool_output || c.author != crate::provenance::Speaker::ToolResult
+                })
                 .map(|c| EnrichedResult {
                     score: r.score,
                     chunk: c.clone(),

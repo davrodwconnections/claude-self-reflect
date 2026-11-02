@@ -2443,11 +2443,14 @@ mod tests {
         assert_eq!(fts5_search(&conn, "alpha", 10, None).unwrap().len(), 1);
         assert_eq!(fts5_search(&conn, "beta", 10, None).unwrap().len(), 1);
 
-        // The marker stops it from scanning again on the next open.
+        // Drift that appears later (3,001 extra rows on the live corpus on
+        // 2026-11-02, after the one-time pass) is repaired on the next open:
+        // the row counts disagree, so the scan runs again.
         conn.execute("INSERT INTO chunks_fts (rowid, content) VALUES (8888, 'late orphan')", [])
             .unwrap();
         migrations::run(&conn).unwrap();
-        assert_eq!(fts_rows(&conn), 3, "reconcile must run only once");
+        assert_eq!(fts_rows(&conn), 2, "reconcile must run again when the counts drift");
+        assert!(fts5_search(&conn, "late", 10, None).unwrap().is_empty());
     }
 
     #[test]

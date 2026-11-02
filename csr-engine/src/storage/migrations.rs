@@ -390,25 +390,31 @@ pub fn run(conn: &Connection) -> Result<()> {
          );",
     )?;
 
-    reconcile_chunks_fts_once(conn)?;
+    reconcile_chunks_fts(conn)?;
 
     super::notes::migrate(conn)?;
 
     Ok(())
 }
 
-/// One-time repair of chunks_fts drift. Before the insert path dropped the old
-/// FTS row, every REPLACE of a chunk left one orphan behind (96k orphans next to
-/// 250k chunks on the live corpus), which skews BM25 statistics and wastes the
-/// index. Full scans, so it is gated by a meta marker and never re-runs; the
-/// fixed insert path keeps the table in sync afterwards.
-fn reconcile_chunks_fts_once(conn: &Connection) -> Result<()> {
+/// Repair of chunks_fts drift. Before the insert path dropped the old FTS row,
+/// every REPLACE of a chunk left one orphan behind (96k orphans next to 250k
+/// chunks on the live corpus), which skews BM25 statistics and wastes the index.
+/// Full scans, so the pass is gated: it runs once (meta marker) and again
+/// whenever the two row counts disagree — 3,001 extra rows had reappeared on
+/// the live corpus by 2026-11-02 despite the fixed insert path. Two `count(*)`
+/// per open is the price; stale text at equal counts is not re-detected.
+fn reconcile_chunks_fts(conn: &Connection) -> Result<()> {
     const MARKER: &str = "chunks_fts_reconciled_v1";
     let done: bool = conn
         .prepare("SELECT 1 FROM meta WHERE key = ?1")?
         .exists([MARKER])?;
     if done {
-        return Ok(());
+        let chunks: i64 = conn.query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))?;
+        let fts: i64 = conn.query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0))?;
+        if chunks == fts {
+            return Ok(());
+        }
     }
     let tx = conn.unchecked_transaction()?;
     let mut removed = tx.execute(
@@ -428,7 +434,7 @@ fn reconcile_chunks_fts_once(conn: &Connection) -> Result<()> {
         [],
     )?;
     tx.execute(
-        "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
         rusqlite::params![MARKER, format!("removed={removed} added={added}")],
     )?;
     tx.commit()?;
