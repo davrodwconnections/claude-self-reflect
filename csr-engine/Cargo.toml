@@ -7,10 +7,7 @@ description = "Claude Self-Reflect: Rust MCP server with embedded vector search"
 [dependencies]
 # ~1.6: rmcp 1.7 moved Content/RawResource and made structs non-exhaustive — migration deferred (see #203)
 rmcp = { version = "~1.6", features = ["server", "transport-io", "macros", "elicitation"] }
-# directml: optional GPU execution through DirectML (CSR_GPU=directml).
-fastembed = { version = "5.9", features = ["directml"] }
-# Same ort fastembed resolves to; direct only to name the DirectML provider.
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["directml"] }
+fastembed = "5.9"
 hnsw_rs = "0.3"
 rusqlite = { version = "0.40", features = ["bundled", "vtab"] }
 notify = "8"
@@ -41,6 +38,13 @@ ast-grep-language = { version = "0.42", default-features = false, features = [
 ] }
 ratatui = "0.30"
 crossterm = "0.29"
+
+# DirectML exists only on Windows; other platforms run ONNX on the CPU.
+[target.'cfg(windows)'.dependencies]
+# directml: optional GPU execution through DirectML (CSR_GPU=directml).
+fastembed = { version = "5.9", features = ["directml"] }
+# Same ort fastembed resolves to; direct only to name the DirectML provider.
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["directml"] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

@@ -392,6 +392,8 @@ pub fn run(conn: &Connection) -> Result<()> {
 
     reconcile_chunks_fts_once(conn)?;
 
+    super::notes::migrate(conn)?;
+
     Ok(())
 }
 

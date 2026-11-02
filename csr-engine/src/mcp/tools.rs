@@ -64,7 +64,7 @@ fn hybrid_pool() -> usize {
 
 /// Ordering bonus for a chunk at `rank` (0-based) in the BM25 list.
 /// `CSR_HYBRID_WEIGHT=0` turns the lexical signal off for A/B runs.
-fn lexical_bonus(rank: Option<usize>) -> f32 {
+pub(crate) fn lexical_bonus(rank: Option<usize>) -> f32 {
     let weight = std::env::var("CSR_HYBRID_WEIGHT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -74,7 +74,7 @@ fn lexical_bonus(rank: Option<usize>) -> f32 {
     })
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();

@@ -1,0 +1,9 @@
+[Unit]
+Description=Consistent backup of the CSR database
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+WorkingDirectory=%h/.local/share/csr-shared-service
+ExecStart=/usr/bin/python3 %h/.local/share/csr-shared-service/rebuild_index.py --backup-only

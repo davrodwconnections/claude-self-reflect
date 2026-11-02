@@ -11,7 +11,8 @@ HINT_TIMEOUT_S=30
 MIN_PROMPT_CHARS=20
 
 def post(cfg, route, body, timeout):
-    request=urllib.request.Request(f"http://127.0.0.1:{cfg['port']}{route}",data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+cfg['token']})
+    base=cfg.get('service_url') or f"http://127.0.0.1:{cfg['port']}"
+    request=urllib.request.Request(f"{base}{route}",data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+cfg['token']})
     with urllib.request.urlopen(request,timeout=timeout) as response:return json.load(response)
 
 def log_hint(prompt_chars, candidates, shown, threshold, seconds):
@@ -55,16 +56,21 @@ def prompt_hint(event, cfg):
 def main():
     kind=sys.argv[1] if len(sys.argv)>1 else ''
     if kind=='session-start':
-        print('CSR shared memory: consult claude-self-reflect proactively when past decisions or work matter. Start with 3 results; expand only for missing evidence. No automatic history summary.')
+        policy=BASE/'project-notes-policy.txt'
+        if not policy.exists():policy=BASE.parents[1]/'csr-engine/data/PROJECT_NOTES_POLICY.txt'
+        # One canonical policy; startup emits only its concise first-line reminder.
+        print(policy.read_text(encoding='utf8').splitlines()[0])
         return
     try:
         event=json.load(sys.stdin)
         cfg=json.loads((BASE/'config.json').read_text(encoding='utf8'))
+        if 'token_file' in cfg:cfg['token']=pathlib.Path(cfg['token_file']).expanduser().read_text(encoding='utf8').strip()
         if kind=='prompt-submit':
             prompt_hint(event,cfg)
             return
         path=event.get('transcript_path')
-        if not path:return
+        # A remote service cannot read this machine's files; it fetches them itself.
+        if not path or cfg.get('service_url'):return
         project=event.get('cwd','unscoped')
         root=pathlib.Path(cfg['projects_dir']).resolve()
         source=pathlib.Path(path).resolve()

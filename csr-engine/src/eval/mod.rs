@@ -353,7 +353,7 @@ fn test_tool_count() -> EvalResult {
     // Counted from the live rmcp router, not a constant — a hardcoded expectation
     // sat at 14 while the server shipped 15 tools (silently-inert eval).
     let actual = crate::mcp::CsrServer::tool_count();
-    let expected = 16; // 15 agent tools + private shared-worker import
+    let expected = 19; // 15 legacy tools + note reader/writer + 2 private worker tools
     let detail = format!("{actual} MCP tools defined (expected {expected})");
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     if actual == expected {

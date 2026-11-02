@@ -6,6 +6,10 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--notes-policy") {
+        print!("{}", csr_engine::storage::notes::POLICY);
+        return Ok(());
+    }
     if args.get(1).map(String::as_str) == Some("--catalog") {
         println!("{}", serde_json::to_string(&CsrServer::tool_catalog())?);
         return Ok(());
@@ -20,6 +24,7 @@ async fn main() -> Result<()> {
     }
     // Run ONNX on the GPU (DirectML) unless told otherwise; this machine's CPU
     // crashes under sustained ONNX load. Falls back to the CPU if the GPU fails.
+    #[cfg(windows)]
     if std::env::var_os("CSR_GPU").is_none() {
         std::env::set_var("CSR_GPU", "directml");
     }

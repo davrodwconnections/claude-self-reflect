@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily CSR database backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

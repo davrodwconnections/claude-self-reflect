@@ -166,6 +166,7 @@ pub(crate) fn spawn_idle_unloader<T: Send + 'static>(
 /// (CPU). Registration errors instead of silently falling back, so callers can
 /// log the fallback; on this machine the CPU crashes under sustained ONNX load
 /// (i9-13900K instability), which is why the GPU path exists.
+#[cfg(windows)]
 pub(crate) fn gpu_providers() -> Option<Vec<fastembed::ExecutionProviderDispatch>> {
     if std::env::var("CSR_GPU").ok().as_deref() != Some("directml") {
         return None;
@@ -174,6 +175,12 @@ pub(crate) fn gpu_providers() -> Option<Vec<fastembed::ExecutionProviderDispatch
         .with_performance_preference(ort::ep::directml::PerformancePreference::HighPerformance)
         .build()
         .error_on_failure()])
+}
+
+/// No GPU route off Windows: ONNX runs on the CPU.
+#[cfg(not(windows))]
+pub(crate) fn gpu_providers() -> Option<Vec<fastembed::ExecutionProviderDispatch>> {
+    None
 }
 
 /// ONNX intra-op threads for embedding; `CSR_EMBED_THREADS` overrides the

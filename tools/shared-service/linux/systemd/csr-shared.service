@@ -1,0 +1,14 @@
+[Unit]
+Description=Shared CSR memory service (MCP over HTTP)
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/.local/share/csr-shared-service
+Environment=TIKTOKEN_CACHE_DIR=%h/.local/share/csr-shared-service/tiktoken-cache
+ExecStart=%h/.local/share/csr-shared-service/.venv/bin/python %h/.local/share/csr-shared-service/service.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

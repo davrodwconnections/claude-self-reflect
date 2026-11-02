@@ -1,0 +1,9 @@
+[Unit]
+Description=Rebuild the CSR HNSW index offline, then swap it in
+
+[Service]
+Type=oneshot
+Nice=15
+IOSchedulingClass=idle
+WorkingDirectory=%h/.local/share/csr-shared-service
+ExecStart=/usr/bin/python3 %h/.local/share/csr-shared-service/rebuild_index.py

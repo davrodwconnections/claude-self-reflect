@@ -1,0 +1,11 @@
+[Unit]
+Description=Fetch PC transcripts and import changed conversations
+After=csr-shared.service
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+WorkingDirectory=%h/.local/share/csr-shared-service
+ExecStart=-/usr/bin/python3 %h/.local/share/csr-shared-service/pull_transcripts.py
+ExecStart=/usr/bin/python3 %h/.local/share/csr-shared-service/scan_import.py

@@ -24,7 +24,8 @@ for i in range(3):
     r=rpc('initialize',{'protocolVersion':'2025-11-25','capabilities':{},'clientInfo':{'name':f'test-{i}','version':'1'}})
     assert 'result' in r,r
     cat=rpc('tools/list',{})['result']['tools']
-    assert len(cat)==16 and not any(t['name']=='csr_internal_import' for t in cat)
+    assert len(cat)==18 and any(t['name']=='csr_project_notes' for t in cat)
+    assert not any(t['name'].startswith('csr_internal_') for t in cat)
 assert request('/status')['worker_pid'] is None
 report['three_clients_discovery_without_worker']=True
 cid='shared-'+uuid.uuid4().hex

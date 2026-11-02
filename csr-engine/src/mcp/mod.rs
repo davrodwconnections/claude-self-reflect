@@ -1,5 +1,6 @@
 pub mod completions;
 pub mod elicitation;
+pub mod notes;
 pub mod resources;
 pub mod tasks;
 pub mod tools;
@@ -255,6 +256,29 @@ impl CsrServer {
     /// Export schemas without loading the model or opening the database.
     pub fn tool_catalog() -> Vec<Tool> {
         Self::tool_router().list_all()
+    }
+
+    #[tool(
+        name = "csr_project_notes",
+        description = "Read curated notes: projects, list (kind/status filters and cursor), search previews, read full topic, history. Use canonical owner/repo. For updates pass search lookup_token to full read, then csr_save_project_note. Never infer approval.",
+        annotations(title = "Project Notes", read_only_hint = true, destructive_hint = false, idempotent_hint = false)
+    )]
+    async fn project_notes(&self, params: Parameters<notes::NoteParams>) -> Result<CallToolResult, rmcp::ErrorData> {
+        // Conflicts are normal tool outcomes, not transport failures that make
+        // the supervisor discard a healthy model/index worker.
+        Ok(match notes::handle(&self.storage, &self.embeddings, params.0).await {
+            Ok(text) => CallToolResult::success(vec![Content::text(text)]),
+            Err(error) => CallToolResult::error(vec![Content::text(error.to_string())]),
+        })
+    }
+
+    #[tool(name = "csr_save_project_note", description = "Save a curated project note with sources/history after searching. Updates require full read with the same lookup_token and expected revision. Do not store secrets or patient data, infer approval, or let delegated workers write shared notes.",
+        annotations(title = "Save Project Note", read_only_hint = false, destructive_hint = false, idempotent_hint = false))]
+    async fn save_project_note(&self, params: Parameters<notes::SaveNoteParams>) -> Result<CallToolResult, rmcp::ErrorData> {
+        Ok(match notes::save(&self.storage,&self.embeddings,params.0).await {
+            Ok(text)=>CallToolResult::success(vec![Content::text(text)]),
+            Err(error)=>CallToolResult::error(vec![Content::text(error.to_string())]),
+        })
     }
 
     #[tool(name = "csr_internal_import", description = "Private shared-worker ingestion; not exposed to agent clients.")]
@@ -777,7 +801,7 @@ impl ServerHandler for CsrServer {
                 .build(),
         )
         .with_instructions(
-            "Claude Self-Reflect: Search past conversations and store reflections with semantic search and time-based memory decay.",
+            format!("Claude Self-Reflect: Search past conversations and store reflections. {}", crate::storage::notes::POLICY),
         )
         .with_server_info(Implementation::new(
             "csr-engine",

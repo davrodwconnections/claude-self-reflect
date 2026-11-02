@@ -8,7 +8,9 @@ directory is swapped in. Chunks imported meanwhile are backfilled by the live wo
 its next start; a chunk re-embedded during the build keeps its older vector until its
 conversation is imported again.
 
-Run weekly by the CSR-Index-Rebuild scheduled task. Standard library only.
+Run weekly by the CSR-Index-Rebuild scheduled task (Windows) or csr-index-rebuild.timer
+(Linux). `--backup-only` keeps just a database backup, for csr-db-backup.timer.
+Standard library only.
 """
 import json, logging, os, pathlib, shutil, signal, sqlite3, subprocess, sys, threading, time, urllib.request
 
@@ -18,6 +20,13 @@ IDLE_WAIT_S = 30 * 60
 
 logging.basicConfig(filename=BASE / "rebuild-index.log", level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
+
+
+def load_config():
+    cfg = json.loads((BASE / "config.json").read_text(encoding="utf8"))
+    if "token_file" in cfg:
+        cfg["token"] = pathlib.Path(cfg["token_file"]).expanduser().read_text(encoding="utf8").strip()
+    return cfg
 
 
 def service_status(cfg):
@@ -60,7 +69,7 @@ def build_index(cfg, db_copy, work):
     with open(work / "worker.log", "wb") as stderr:
         proc = subprocess.Popen([cfg["binary"], str(db_copy), cfg["projects_dir"]],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, env=env,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         watchdog = threading.Timer(BUILD_TIMEOUT_S, proc.kill)
         watchdog.start()
         try:
@@ -113,8 +122,26 @@ def swap(live, new, prev, worker_pid):
         raise
 
 
+def backup_only(cfg):
+    work = pathlib.Path(os.environ.get("TEMP", str(BASE))) / "csr-db-backup"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    try:
+        db_copy = work / "csr-engine.db"
+        logging.info("database copied: %d chunk embeddings", copy_database(pathlib.Path(cfg["db_path"]), db_copy))
+        keep_backup(cfg, db_copy)
+        return 0
+    except Exception:
+        logging.exception("database backup failed")
+        return 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def main():
-    cfg = json.loads((BASE / "config.json").read_text(encoding="utf8"))
+    cfg = load_config()
+    if "--backup-only" in sys.argv:
+        return backup_only(cfg)
     db = pathlib.Path(cfg["db_path"])
     live, prev = db.parent / "shared-index", db.parent / "shared-index.prev"
     work = pathlib.Path(os.environ.get("TEMP", str(BASE))) / "csr-index-rebuild"

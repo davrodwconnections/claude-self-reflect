@@ -561,6 +561,27 @@ fn is_fts_stopword(word: &str) -> bool {
     STOPWORDS.contains(&lower.as_str())
 }
 
+/// Quote and bound terms consistently for conversation and project-note search.
+pub(crate) fn fts5_expression(query: &str) -> String {
+    // Sanitize for FTS5: split into OR-joined quoted words
+    // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
+    // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
+    // Stopwords match most of the corpus: OR-ing them in multiplies the posting
+    // lists BM25 has to walk while adding almost no ranking signal.
+    let separated: String = query.chars().map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { ' ' }).collect();
+    let words: Vec<String> = separated
+        .split_whitespace()
+        .map(str::to_string)
+        .filter(|w| w.chars().count() >= 2 && !is_fts_stopword(w))
+        .take(FTS_MAX_TERMS)
+        .collect();
+    words
+        .iter()
+        .map(|w| format!("\"{}\"", w))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 /// Search chunks using FTS5 full-text search (for file path lookup etc.).
 pub fn fts5_search(
     conn: &Connection,
@@ -568,29 +589,10 @@ pub fn fts5_search(
     limit: usize,
     project: Option<&str>,
 ) -> Result<Vec<ConversationChunk>> {
-    // Sanitize for FTS5: split into OR-joined quoted words
-    // "Apify runaway cost" → '"apify" OR "runaway" OR "cost"' (matches any word)
-    // Quoting prevents hyphens/special chars from being parsed as FTS5 operators
-    // Stopwords match most of the corpus: OR-ing them in multiplies the posting
-    // lists BM25 has to walk while adding almost no ranking signal.
-    let words: Vec<String> = query
-        .split_whitespace()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-                .collect::<String>()
-        })
-        .filter(|w| w.chars().count() >= 2 && !is_fts_stopword(w))
-        .take(FTS_MAX_TERMS)
-        .collect();
-    if words.is_empty() {
+    let fts_query = fts5_expression(query);
+    if fts_query.is_empty() {
         return Ok(Vec::new());
     }
-    let fts_query = words
-        .iter()
-        .map(|w| format!("\"{}\"", w))
-        .collect::<Vec<_>>()
-        .join(" OR ");
 
     let chunks = if let Some(p) = project.filter(|p| *p != "all") {
         let mut stmt = conn.prepare(

@@ -10,6 +10,9 @@ print('[HNSW] building index',flush=True)
 for line in sys.stdin:
  m=json.loads(line)
  if 'id' not in m:continue
+ if m.get('params',{}).get('name')=='invalid':
+  print(json.dumps({'jsonrpc':'2.0','id':m['id'],'error':{'code':-32602,'message':'synthetic invalid params'}}),flush=True)
+  continue
  result={'protocolVersion':'2025-11-25','capabilities':{},'serverInfo':{'name':'fixture','version':'1'}} if m['method']=='initialize' else {'content':[{'type':'text','text':'ok'}]}
  print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
 ''')
@@ -17,6 +20,10 @@ for line in sys.stdin:
   result=await worker.call('probe',{})
   assert result['content'][0]['text']=='ok'
   assert worker.starts==1
+  pid=worker.proc.pid
+  invalid=await worker.call('invalid',{})
+  assert invalid['isError'] and worker.proc.pid==pid and worker.starts==1
+  assert (await worker.call('probe',{}))['content'][0]['text']=='ok'
   await worker._stop()
  print('Non-protocol startup output regression: passed')
 asyncio.run(run())

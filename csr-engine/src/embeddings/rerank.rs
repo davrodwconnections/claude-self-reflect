@@ -22,6 +22,15 @@ const DOC_CHARS: usize = 600;
 /// ONNX intra-op threads when the reranker runs on the CPU.
 const CPU_THREADS: usize = 8;
 
+/// `CSR_RERANK_THREADS` overrides [`CPU_THREADS`].
+fn cpu_threads() -> usize {
+    std::env::var("CSR_RERANK_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(CPU_THREADS)
+}
+
 fn model_from_env() -> Option<RerankerModel> {
     match std::env::var("CSR_RERANKER").ok()?.as_str() {
         "jina" => Some(RerankerModel::JINARerankerV2BaseMultiligual),
@@ -52,7 +61,7 @@ fn load(model: RerankerModel) -> Option<TextRerank> {
     }
     // CPU fallback with bounded threads: ONNX on every core is the load that
     // crashes this machine's CPU.
-    match TextRerank::try_new(options().with_intra_threads(CPU_THREADS)) {
+    match TextRerank::try_new(options().with_intra_threads(cpu_threads())) {
         Ok(m) => Some(m),
         Err(e) => {
             tracing::warn!(error = %e, "reranker init failed; reranking disabled");

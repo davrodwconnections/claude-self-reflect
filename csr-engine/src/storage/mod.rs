@@ -1,5 +1,6 @@
 pub mod codegraph;
 pub mod migrations;
+pub mod notes;
 pub mod queries;
 
 pub use queries::{
